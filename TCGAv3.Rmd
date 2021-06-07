@@ -1,0 +1,3025 @@
+---
+title: "<br> <center> Identification of specific gen expression biomarkers of glioma and patient classification with machine learning <br> Omic data analysis"
+subtitle: "<center> Bioinformatic and Biostatistic Master Course <br> Universitat Oberta de Catalunya"
+author: "<center> Aitor Gómez Osuna"
+date: |
+  <center> `r format(Sys.Date(),"%e de %B, %Y")`
+output: 
+  html_document:
+    toc: true
+    toc_depth: 4
+    toc_float: true
+    smooth_scroll: true
+    collapsed: true
+bibliography: bibliography.bib
+nocite: |
+  @lantz2013machine, @harley15p, @rmarkdowncookbook, @ritchie2015limma,
+  @robinson2010edger, @law2014voom, @alexa2009gene, @law2016rna,
+  @bioconductor, @reproducibleresearch
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, message = FALSE, fig.align = "center" )
+```
+
+# Introduction
+
+## Datasets to be used
+
+We selected three datasets (Projects) from the "Harmonized Cancer Datasets" section from the _[Genomic Data Commons Data Portal](https://portal.gdc.cancer.gov/)_ with "transcriptome profiling" as "Data Category" and "RNA-Seq" as "Experimental Strategy":
+
+| __Project__ | __Primary Site__ | __Focus__ | __Usage__ | __Access__ | 
+|:------------|:-----------------|:----------|:----------|:-----------|
+| TCGA-COAD | colon | Colon Adenocarcinoma | controls | https://portal.gdc.cancer.gov/projects/TCGA-COAD | 
+| TCGA-GBM | brain | Glioblastoma Multiforme | cases | https://portal.gdc.cancer.gov/projects/TCGA-GBM |
+| TCGA-LGG | brain | Brain Lower Grade Glioma | cases | https://portal.gdc.cancer.gov/projects/TCGA-LGG |
+
+## Planified Analysis
+
+Two main blocks defined the analysis plan:
+
+### Block 1: Differential expression analysis
+
+The 1st block includes the traditional analyses to identify differences in gene expression between cases and controls. Here we will perform two analyses:
+
+1. To identify deferentially expressed (DE) genes between cases and controls.
+2. To identify DE genes between the two sets of glioma, since they include samples of different types of glioma.
+
+
+#### Analysis 1
+
+Here we will compare the glioma sets versus the colon set, one at a time
+
+```
+A | TCGA-COAD vs. TCGA-GBM <--- DE genes between colon and glioma
+B | TCGA-COAD vs. TCGA-LGG <--- DE genes between colon and glioma
+```
+#### Analysis 2
+
+From this analysis we want to obtain the DE genes that will help to identify samples from "glioblastoma multiforme" and "brain low grade glioma". Therefore, no "colon adenocarcinoma" samples will be used.
+
+```
+C | TCGA-GBM vs. TCGA-LGG <--- DE genes between glioma and low grade glioma
+```
+  The first analysis helped to identify genes that classify cases and controls. The current result help classify types of cases.
+
+### Block 2: machine learning
+
+This block is focused on machine learning techniques to properly classify patients with (sub-)types of glioma.
+
+#### Analysis 3
+
+This analysis is focused on understanding how clustering algorithms works and classifies samples. Therefore, knn, k-means,  herarchical clustering, Gaussian Mixture Model (GMM) and DBSCAN will be used to classify the samples but:
+
+1. The three datasets with all the features will be clustered (asking for three group in non supervised analysis).  
+2. The three datasets but with only the union of the DE genes from analysis 1 and analysis 2.  
+3. Only glioma datases with all the features will be clustered (asking for two group in non supervised analysis)  
+4. Only glioma datases but with only the features from analysis 2.  
+
+
+```{r initial packages, message=FALSE, warning=FALSE}
+## packages to be used in the analysis
+library(Biobase)
+library(SummarizedExperiment)
+library(TCGAbiolinks)
+library(factoextra)
+library(edgeR)
+library(limma)
+
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+
+library(ggvenn)
+library(gplots)
+library(ggpubr)
+library(RColorBrewer)
+library(scales)
+
+library(clusterProfiler)
+library(rWikiPathways)
+library(DOSE)
+library(magrittr)
+library(enrichplot)
+library(Rgraphviz)
+
+library(dplyr)
+library(cowplot)
+library(kableExtra)
+library(tm)
+library(wordcloud)
+```
+
+# Data
+
+## Data download
+
+First all the data from TGCA projects are download.
+
+```{r tcga_gbm, eval=FALSE}
+tcga_gbm <- GDCquery(
+  project = "TCGA-GBM",
+  data.category = "Transcriptome Profiling",
+  experimental.strategy = "RNA-Seq",
+  workflow.type = "HTSeq - Counts"
+)
+
+GDCdownload(query = tcga_gbm)
+tcga_gbm <- GDCprepare(tcga_gbm)
+save(tcga_gbm, file="data/tcga_gbm_se.RData")
+```
+
+```{r tcga_lgg, eval=FALSE}
+tcga_lgg <- GDCquery(
+  project = "TCGA-LGG",
+  data.category = "Transcriptome Profiling",
+  experimental.strategy = "RNA-Seq",
+  workflow.type = "HTSeq - Counts"
+)
+
+GDCdownload(query = tcga_lgg)
+tcga_lgg <- GDCprepare(tcga_lgg)
+save(tcga_lgg, file="data/tcga_lgg_se.Rdata")
+```
+
+```{r tcga_coad, eval=FALSE}
+tcga_coad <- GDCquery(
+  project = "TCGA-COAD",
+  data.category = "Transcriptome Profiling",
+  experimental.strategy = "RNA-Seq",
+  workflow.type = "HTSeq - Counts"
+)
+
+GDCdownload(query = tcga_coad)
+tcga_coad <- GDCprepare(tcga_coad)
+save(tcga_coad, file="data/tcga_coad_se.RData")
+```
+
+### From SummarizedExperiment to ExpressionSet
+
+The SummarizedExperiment objects are converted to ExpressionSet. Data download of the data is a proccess that may require some time and computational cost. In this sense, data are saved as a Rdata file. 
+
+```{r gbm_exprs, eval=FALSE}
+class(tcga_gbm)
+
+tcga_gbm <- ExpressionSet(
+    assayDat = assays(tcga_gbm)[[1]],
+    phenoData = as(data.frame(colData(tcga_gbm)), "AnnotatedDataFrame"),
+    featureData = as(data.frame(rowData(tcga_gbm)), "AnnotatedDataFrame"),
+    experimentData = MIAME()
+)
+
+class(tcga_gbm)
+save(tcga_gbm, file="data/tcga_gbm.RData")
+```
+
+```{r lgg_exprs, eval=FALSE}
+class(tcga_lgg)
+
+tcga_lgg <- ExpressionSet(
+    assayDat = assays(tcga_lgg)[[1]],
+    phenoData = as(data.frame(colData(tcga_lgg)), "AnnotatedDataFrame"),
+    featureData = as(data.frame(rowData(tcga_lgg)), "AnnotatedDataFrame"),
+    experimentData = MIAME()
+)
+
+class(tcga_lgg)
+save(tcga_lgg, file="data/tcga_lgg.RData")
+```
+
+```{r coad_exprs, eval=FALSE}
+class(tcga_coad)
+
+tcga_coad <- ExpressionSet(
+    assayDat = assays(tcga_coad)[[1]],
+    phenoData = as(data.frame(colData(tcga_coad)), "AnnotatedDataFrame"),
+    featureData = as(data.frame(rowData(tcga_coad)), "AnnotatedDataFrame"),
+    experimentData = MIAME()
+)
+
+class(tcga_coad)
+save(tcga_coad, file="data/tcga_coad.RData")
+```
+
+### Load data
+
+In the case, you need to load the data from file.
+
+```{r load datasets}
+load("data/tcga_gbm.RData")
+load("data/tcga_lgg.RData")
+load("data/tcga_coad.RData")
+```
+
+# Analysis 1
+
+## Filtering
+
+The data is generated using RNA-Seq technology and processed with HTSeq, indicating that the expression matrices of the ExpressionSet contains _counts_:
+
+Therefore is should be analyzed using combining `voom` with `limma`.
+
+Let's see the features(genes) in common across the three sets:
+
+```{r common features}
+int_fet <- intersect(
+  intersect(featureNames(tcga_gbm), featureNames(tcga_lgg)), 
+            featureNames(tcga_coad)
+)
+length(int_fet)
+```
+
+```{r join cases}
+#Join cases
+raw_exprs <- cbind(
+  exprs(tcga_gbm[int_fet, ]),
+  exprs(tcga_lgg[int_fet, ]),
+  exprs(tcga_coad[int_fet, ])
+)
+dim(raw_exprs)
+save(raw_exprs, file="data/raw_exprs.RData")
+
+
+#groups in dataset
+group_f <- as.factor(ifelse(colnames(raw_exprs) %in% sampleNames(tcga_gbm), "gbm",
+                          ifelse(colnames(raw_exprs) %in% sampleNames(tcga_lgg), "lgg",
+                                 "colon")
+                          )
+                   )
+table(group_f)
+
+#Deleting variables
+rm(tcga_coad,tcga_gbm,tcga_lgg, int_fet)
+```
+
+In the join dataset, there are `r dim(raw_exprs)[1]` genes and `r dim(raw_exprs)[2]` cases.
+
+
+### Signal Expression Filtering
+
+Three differents filter approach has been follow:
+  + Based on count variance
+  + Based on FilterByExprs function from edgeR (CPM equal to 10 divided by median library size in M)
+  + Based on standard CPM thresold 1
+
+```{r SEF full data}
+#for filtering purpose data are transformed to log-cpm
+myCPM <-cpm(raw_exprs)
+
+#mean and median of library sizes in M
+col_sum <- colSums(raw_exprs)
+mlib <- mean(col_sum) * 1e-6
+mlib
+medlib <- median(col_sum) * 1e-6
+medlib
+hist(col_sum * 1e-6, 
+     las= 2, col = "navyblue",
+     main="Histogram of library sizes", 
+     xlab="Library size (M)")
+abline(v = mlib, col = "grey")
+abline(v = medlib, col = "red")
+
+### Variance filtering
+#Based on variance > 1 of counts for each gene
+var_set <- apply(raw_exprs, 1, var)
+#number of genes retained with var set approach
+sum(var_set > 1)
+
+
+### FilterByExprs function
+# Based on FilterByExprs function from edgeR
+keep.exprs <- filterByExpr(raw_exprs, group = group_f)
+#number of genes retained with var set approach
+sum(keep.exprs)
+
+
+### CPM equal to standard value 1
+# threshold to get upper values
+thresh <- myCPM > 1
+#cpm equal to 1 is a standard threshold
+
+# Genes which are retained are those whose cpm is 
+# above thresh in half of the minimum cases of the 
+# less abundant group cases
+#n samples retained
+keepn <- round(min(tabulate(group_f))*0.5,0)
+#genes to retain
+keepcpm <- rowSums(thresh) >= keepn
+#number of genes retained with cpm > 1 approach
+sum(keepcpm)
+#identifying retained genes
+keeprow <- attr(keepcpm,"names")[keepcpm==T]
+```
+
+Genes after filtering for every aproach:
+  + Based on count variance = `r table(var_set > 1)[2]`  
+  + Based on FilterByExprs function from edgeR = `r table(keep.exprs)[2]`
+  + Based on standard CPM thresold 1 = `r table(keepcpm)[2]`
+  
+Between the last two, it shouldn't be a big different, but the first approach is not recommended due to it is calculated only with the variance of the counts, without taking into account library size.
+
+```{r SEF full data 2}
+#filter dataset
+full_exprs <- raw_exprs[keeprow,]
+save(full_exprs, file="data/full_exprs.RData")
+
+#deleting variables
+rm(myCPM, var_set, keep.exprs, 
+   thresh, keepcpm, keepn, keeprow,
+   medlib,mlib,col_sum)
+```
+
+
+## Exploratory analyses
+
+### Principal Component Analysis
+
+As well as how they behave in a PCA:
+
+```{r pca full data, cache = TRUE}
+set.seed(123456789)
+#### Optional
+## Reducing number of cases to reduce computational cost
+## If you want to reduce number of cases changes percent
+percent <- 1
+pca_samples_ids <- sort(sample(x =  1:length(colnames(full_exprs)),
+                      size = length(colnames(full_exprs))*percent,
+                      replace = FALSE))
+pca_group <- group_f[pca_samples_ids]
+
+#Proportion in the full and in the reduced datasets of PCA
+prop.table(table(pca_group))
+prop.table(table(group_f))
+
+#PCA function prcomp CENTERING but NOT scaling
+pca_f <- prcomp(t(full_exprs[,pca_samples_ids]), 
+                center = TRUE, 
+                scale = FALSE)
+#PCA plot
+fig_pca.a1 <- fviz_pca_ind(pca_f,
+                    geom = "point",
+                    col.ind = pca_group
+                    )
+fig_pca.a1
+#deleting variables
+rm(pca_f)
+```
+
+
+## Normalization
+
+Normalization is done with edgeR and then voom transformation and calculation of variance weights.
+
+```{r normalization protocol edgeR and limma-voom full data}
+countstovoom <- function(data, group, use.method = "TMM", make.plot = TRUE){
+  #DGE built object
+  dge <- DGEList(data)
+  
+  #calculations of norm factors based on library size
+  normfactor <- calcNormFactors(dge,method = use.method)
+
+  #model design based on dataset groups
+  design_mod <- model.matrix(~ 0 + group)
+  colnames(design_mod) <- levels(group)
+
+  #voom function object
+  return(voom(normfactor,design_mod, plot = make.plot))
+  
+  #deleting variables
+  rm(dge,normfactor)
+}
+
+#apply voom fn
+v.F <- countstovoom(full_exprs, group_f)
+save(v.F, file="data/v.F.RData")
+```
+
+
+### Exploratory analysis after Normalization
+
+### Principal components analysis
+
+How they behave after data normalization in the PCA?
+
+```{r pca normalized full data, cache=TRUE}
+#pca function 
+pcanorm_f <- prcomp(t(v.F$E[,pca_samples_ids]), 
+                    center = TRUE, 
+                    scale = FALSE)
+
+#pca plot
+fig_pcanorm.a1 <- fviz_pca_ind(pcanorm_f,
+                    geom = "point",
+                    col.ind = pca_group)
+fig_pcanorm.a1
+
+#deleting variables
+rm(pcanorm_f, pca_samples_ids, pca_group)
+```
+
+
+## Linear Model 
+
+In this step, lmFit functions built a model using voom data and with makeConstrasts of `limma` groups comparisons are specified.
+
+```{r linear model full data}
+#function to built linear model
+linmod <- function(voomobj, group, contrast.mod, make.plot = TRUE){
+  
+  #model design based on dataset groups
+  design <- model.matrix(~ 0 + group)
+  colnames(design) <- levels(group)
+  
+  #lmFit function limma
+  lm <- lmFit(voomobj,design)
+  
+  #makeContrasts function
+  contmat <- makeContrasts(contrasts = contrast.mod,
+                           levels = design)
+
+  #contrasts.fit function based on linear model
+  fit.cont <- contrasts.fit(lm,contmat)
+
+  #bayesian transformation
+  fit.cont <- eBayes(fit.cont)
+
+  #normalized fitlinear plot
+  if (make.plot == TRUE){
+    plotSA(fit.cont, main = "voom: Mean-variance trend")
+  }
+  
+  return(fit.cont)
+}
+
+#Building linear model 
+fit.cont.F <- linmod(v.F,group_f,
+                   contrast.mod = c("gbm-colon", "lgg-colon"))
+save(fit.cont.F, file="data/fit.cont.F.RData")
+```
+
+## DE analysis 1
+
+DEA is performed based on TREAT function and topTREAT [@mccarthy2009testing]. The function `treat` of limma library allow from the fit.cont object and a "log fold change" (logFC) recalculate the moderate t-statistics and p-values. This procedure is much more precise to control FDR than discard genes based on p-values and logFC.
+
+Annotation was done with the `org.Hs.eg.db` database using `ENTREZID`, `SYMBOL` and `GENENAME` features.
+
+```{r DEA 1 full data}
+#DEG based on treat function procedure
+fit.treat.F <- treat(fit.cont.F,lfc=2)
+res.treat.F <- decideTests(fit.treat.F)
+
+#Annotation for fit.treat object
+ann <- AnnotationDbi::select(org.Hs.eg.db,
+                             keys=rownames(fit.treat.F),
+                             keytype= "ENSEMBL",
+                             columns=c("ENTREZID","SYMBOL","GENENAME"),
+                             multiVals="first")
+
+#removing duplicated in the samples
+ann <- ann[!duplicated(ann$ENSEMBL),]
+
+#adding gen labels to fit.treat_genes
+fit.treat.F$genes <- ann
+
+#GBM vs colon
+topGBM <- topTreat(fit.treat.F,
+                   coef= "gbm-colon",
+                   sort.by= "logFC",
+                   number = sum(summary(
+                       res.treat.F)[,"gbm-colon"]))
+rownames(topGBM) <- NULL
+head(topGBM, 10)
+
+
+#LGG vs colon
+topLGG <- topTreat(fit.treat.F,
+                   coef= "lgg-colon",
+                   sort.by= "logFC",
+                   number = sum(summary(
+                       res.treat.F)[,"lgg-colon"]))
+rownames(topLGG) <- NULL
+head(topLGG, 10)
+
+#savedata
+dir.create(path = "DEAsets")
+writexl::write_xlsx(topGBM, path = "DEAsets/topGBM.xlsx")
+writexl::write_xlsx(topLGG, path = "DEAsets/topLGG.xlsx")
+save(topGBM,file = "data/topGBM.RData")
+save(topLGG, file = "data/topLGG.RData")
+
+#Sum up of all the DEG for comparisons.
+summary(res.treat.F)
+
+#delenting variables
+rm(ann, fit.cont.F)
+```
+
+### DE genes plots
+
+#### MD plot
+
+Mean-difference plots as a results of the DEA.
+
+```{r MD plots full data}
+par(mfrow=c(1,2))
+#MD gbm vs colon
+md.dea1 <- plotMD(fit.treat.F,coef=1,
+       status=res.treat.F[,"gbm-colon"], 
+       values=c(-1,1),
+       main = "GBM vs colon",
+       legend = FALSE,
+       cex = 0.1)
+abline(h=0,col="grey")
+
+#MD lgg vs colon
+plotMD(fit.treat.F,coef=2,
+       status=res.treat.F[,"lgg-colon"], 
+       values=c(-1,1),
+       main = "LGG vs colon",
+       legend = FALSE,
+       cex = 0.1)
+abline(h=0,col="grey")
+```
+
+#### Gene sets of DEA1
+
+This chunk consiste on create gene sets for functional analysis afterwards.
+
+```{r Gene sets from full data DEA1}
+p.value <- .05
+log.FC <- 2
+IDgene <- c("ENTREZID", "ENSEMBL","SYMBOL")
+parameter <- c("logFC", "adj.P.Val")
+
+##GBM genesets
+#universe geneset
+gbm.all.genelist <- topGBM[,c(IDgene,parameter)]
+gbm.all.gene <- gbm.all.genelist[,"logFC"]
+names(gbm.all.gene) <- as.character(gbm.all.genelist[,"ENTREZID"])
+gbm.all.gene <- sort(gbm.all.gene, decreasing = TRUE)
+
+#up geneset
+gbm.up.genelist <- topGBM[topGBM$adj.P.Val < p.value & topGBM$logFC > log.FC,
+                      c(IDgene,parameter)]
+gbm.up.gene <- gbm.up.genelist[,"logFC"]
+names(gbm.up.gene) <- as.character(gbm.up.genelist[,"ENTREZID"])
+gbm.up.gene <- sort(gbm.up.gene, decreasing = TRUE)
+#down geneset
+gbm.dn.genelist <- topGBM[topGBM$adj.P.Val < p.value & topGBM$logFC < log.FC,
+                      c(IDgene,parameter)]
+gbm.dn.gene <- gbm.dn.genelist[,"logFC"]
+names(gbm.dn.gene) <- as.character(gbm.dn.genelist[,"ENTREZID"])
+gbm.dn.gene <- sort(gbm.dn.gene, decreasing = TRUE)
+
+##LGG genesets
+#universe geneset
+lgg.all.genelist <- topLGG[,c(IDgene,parameter)]
+lgg.all.gene <- lgg.all.genelist[,"logFC"]
+names(lgg.all.gene) <- as.character(lgg.all.genelist[,"ENTREZID"])
+lgg.all.gene <- sort(lgg.all.gene, decreasing = TRUE)
+
+#up geneset
+lgg.up.genelist <- topLGG[topLGG$adj.P.Val < p.value & topLGG$logFC > log.FC,
+                      c(IDgene,parameter)]
+lgg.up.gene <- lgg.up.genelist[,"logFC"]
+names(lgg.up.gene) <- as.character(lgg.up.genelist[,"ENTREZID"])
+lgg.up.gene <- sort(lgg.up.gene, decreasing = TRUE)
+
+#down geneset
+lgg.dn.genelist <- topLGG[topLGG$adj.P.Val < p.value & topLGG$logFC < log.FC,
+                      c(IDgene,parameter)]
+lgg.dn.gene <- lgg.dn.genelist[,"logFC"]
+names(lgg.dn.gene) <- as.character(lgg.dn.genelist[,"ENTREZID"])
+lgg.dn.gene <- sort(lgg.dn.gene, decreasing = TRUE)
+
+
+##function to identify tables after Functional analysis
+id.table <- function(tableid, size = 20){
+  var.name <<- deparse(substitute(tableid))
+  table.name <<- head(tableid, size)
+  table.name$table.id <<- rep(var.name,size)  #add a table id
+  classif <<- strsplit2(table.name$table.id, split = "\\.")
+  colnames(classif) <<- c("tool","cancer","regulation_proccess")
+  table.name <- cbind(table.name, classif)
+  return(table.name)
+}
+```
+
+#### Venn Diagram
+
+Venn diagrams are showed as a result of DEA. Genes up and down-regulated are represented for each subtype of glioma.
+
+```{r venn Diagram full data}
+#list for venn diagram
+venn_list <- list(gbm.up = gbm.up.genelist$ENSEMBL,
+                  gbm.down = gbm.dn.genelist$ENSEMBL,
+                  lgg.up = lgg.up.genelist$ENSEMBL,
+                  lgg.down = lgg.dn.genelist$ENSEMBL)
+
+v.table <- venn(data = venn_list,
+                universe = gbm.all.genelist$ENSEMBL,
+                small=0.7, showSetLogicLabel=FALSE,
+                show.plot=FALSE, intersections=TRUE,
+                names = c("GBM vs colon up",
+                          "GBM vs colon down",
+                          "LGG vs colon up",
+                          "LGG vs colon down")
+)
+isect <- attr(v.table, "intersection")
+
+#venn diagram plot
+par(mfrow=c(1,1))
+ggvenn(venn_list, 
+       fill_color = brewer.pal(8, "Dark2"),
+       stroke_size = 0.2, set_name_size = 4.5)
+```
+
+
+
+###  Specific genes as potential biomarkers of glioma
+
+In this chunk, it is shown genes that are exclusive for GBM vs colon, and LGG vs colon.
+
+```{r specific genes as potential biomarkers of glioma}
+#specific genes for up and regulation in GBM excluding common genes with lgg vs colon comparison
+gbm.specific <- c(isect[["GBM vs colon up"]],isect[["GBM vs colon down"]])
+length(gbm.specific)
+gbm.specific.table <- topGBM[topGBM$ENSEMBL %in% gbm.specific,]
+head(gbm.specific.table)
+
+#specific genes for up and down regulation in LGG excluding common genes with gbm vs colon comparison
+lgg.specific <- c(isect[["LGG vs colon up"]],isect[["LGG vs colon down"]])
+length(lgg.specific)
+lgg.specific.table <- topLGG[topLGG$ENSEMBL %in% lgg.specific,]
+head(lgg.specific.table)
+```
+
+
+### Functional analysis DEA1
+
+#### rWikipatways functional analysis
+
+Analysis from rwikipathways [@slenter2018wikipathways].
+
+clusterProfiler provides `enricher` function for hypergeometric test and `GSEA` function for gene set enrichment analysis that are designed to accept user defined annotation. First we are gonna update information for Wikipathways and download the data from database.
+
+```{r wikipathways data download and preparation DEA1}
+#Download pathways from homo sapiens to localfile
+wp.hs.gmt<- downloadPathwayArchive(organism="Homo sapiens",
+                       format="gmt")
+wp2gene <- readPathwayGMT(wp.hs.gmt)
+
+#Establish ID for wikipathways database
+wpid2gene <- wp2gene %>% dplyr::select(wpid,gene) #TERM2GENE
+wpid2name <- wp2gene %>% dplyr::select(wpid,name) #TERM2NAME
+```
+
+
+##### ORA analysis just needs a list of ENTREZ ids.
+
+```{r ORA in rwikipathways DEA1}
+### GBM 
+#ORA pathway up
+ewp.gbm.up <- enricher(gene = names(gbm.up.gene),
+                       universe = names(gbm.all.gene),
+                       pAdjustMethod = "BH",
+                       pvalueCutoff = .05,
+                       TERM2GENE = wpid2gene,
+                       TERM2NAME = wpid2name)
+ewp.gbm.up <- DOSE::setReadable(ewp.gbm.up, org.Hs.eg.db, keyType = "ENTREZID")
+head(ewp.gbm.up)
+p1<-barplot(ewp.gbm.up, 
+            showCategory = 7, 
+            font.size = 7,
+            label_format = 15)+
+  ggtitle("GBM vs Colon DEG up")
+ewp.gbm.up <- id.table(ewp.gbm.up)
+
+
+
+#ORA pathway dn
+ewp.gbm.dn <- enricher(gene = names(gbm.dn.gene),
+                       universe = names(gbm.all.gene),
+                       pAdjustMethod = "BH",
+                       pvalueCutoff = .05,
+                       TERM2GENE = wpid2gene,
+                       TERM2NAME = wpid2name)
+ewp.gbm.dn <- DOSE::setReadable(ewp.gbm.dn, org.Hs.eg.db, keyType = "ENTREZID")
+head(ewp.gbm.dn)
+p2<-barplot(ewp.gbm.dn,            
+            showCategory = 7, 
+            font.size = 7,
+            label_format = 15)+
+  ggtitle("GBM vs Colon DEG down")
+ewp.gbm.dn <- id.table(ewp.gbm.dn, size = 12)
+
+### LGG 
+#ORA pathway up
+ewp.lgg.up <- enricher(gene = names(lgg.up.gene),
+                       universe = names(lgg.all.gene),
+                       pAdjustMethod = "BH",
+                       pvalueCutoff = .05,
+                       TERM2GENE = wpid2gene,
+                       TERM2NAME = wpid2name)
+ewp.lgg.up <- DOSE::setReadable(ewp.lgg.up, org.Hs.eg.db, keyType = "ENTREZID")
+head(ewp.lgg.up)
+p3<-barplot(ewp.lgg.up,             
+            showCategory = 7, 
+            font.size = 7,
+            label_format = 15) +
+  ggtitle("LGG vs Colon DEG up")
+ewp.lgg.up <- id.table(ewp.lgg.up)
+
+#ORA pathway dn
+ewp.lgg.dn <- enricher(gene = names(lgg.dn.gene),
+                       universe = names(lgg.all.gene),
+                       pAdjustMethod = "BH",
+                       pvalueCutoff = .05,
+                       TERM2GENE = wpid2gene,
+                       TERM2NAME = wpid2name)
+ewp.lgg.dn <- DOSE::setReadable(ewp.lgg.dn, org.Hs.eg.db, keyType = "ENTREZID")
+head(ewp.lgg.dn)
+p4<-barplot(ewp.lgg.dn,            
+            showCategory = 7, 
+            font.size = 7,
+            label_format = 15)+
+  ggtitle("LGG vs Colon DEG down")
+ewp.lgg.dn <- id.table(ewp.lgg.dn)
+
+#plot grid for results
+pt <- plot_grid(p1,p2,p3,p4, ncol = 2)
+
+## to collect all functional analysis results
+keep.colums.enricher <- c("ID","Description","pvalue","p.adjust","Count","geneID",
+                          "table.id","tool","cancer","regulation_proccess")
+fa.DEA1 <- rbind(ewp.gbm.up[,keep.colums.enricher], 
+                  ewp.gbm.dn[,keep.colums.enricher], 
+                  ewp.lgg.up[,keep.colums.enricher], 
+                  ewp.lgg.dn[,keep.colums.enricher])
+```
+
+##### GSEA analysis with wikipathways
+
+```{r GSEA in rwikpathways DEA1}
+set.seed(1234567)
+## GBM GSEA
+gwp.gbm <- GSEA(geneList = c(gbm.up.gene,
+                             gbm.dn.gene),
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.05,
+                TERM2GENE = wpid2gene,
+                TERM2NAME = wpid2name,
+                verbose = FALSE
+                   )
+gwp.gbm <- setReadable(gwp.gbm, 'org.Hs.eg.db', 'ENTREZID')
+
+#network plot gbm gsea
+cnetplot(gwp.gbm, 
+         foldChange=c(gbm.up.gene,
+                      gbm.dn.gene),
+         repel = TRUE,
+         showCategory = 15,
+         colorEdge = FALSE,
+         circular = FALSE,
+         cex_category = 0.6,
+         cex_gene = 0.4,
+         cex_label_category = 0.6,
+         cex_label_gene = 0.3,
+         main = "GBM vs colon")
+
+#gbm gsea wikipathways up
+gwp.gbm.up <- gwp.gbm[which(gwp.gbm$NES > 1),]
+head(gwp.gbm.up)
+gwp.gbm.up <- id.table(gwp.gbm.up, size = 17)
+
+#gbm gsea wikipathways down
+gwp.gbm.dn <- gwp.gbm[which(gwp.gbm$NES < -1),]
+head(gwp.gbm.dn)
+gwp.gbm.dn <- id.table(gwp.gbm.dn, size = 5)
+
+
+
+## LGG GSEA
+gwp.lgg <- GSEA(geneList = c(lgg.up.gene,
+                             lgg.dn.gene),
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.05,
+                TERM2GENE = wpid2gene,
+                TERM2NAME = wpid2name,
+                verbose = FALSE
+                   )
+gwp.lgg <- setReadable(gwp.lgg, 'org.Hs.eg.db', 'ENTREZID')
+
+#network plot lgg gsea
+cnetplot(gwp.lgg, 
+         categorySize="pvalue", 
+         foldChange=c(lgg.up.gene,
+                      lgg.dn.gene),
+         repel = TRUE,
+         showCategory = 15,
+         colorEdge = FALSE,
+         circular = FALSE,
+         cex_category = 0.6,
+         cex_gene = 0.4,
+         cex_label_category = 0.6,
+         cex_label_gene = 0.3)
+
+#lgg gsea wikipathways up
+gwp.lgg.up <- gwp.lgg[which(gwp.lgg$NES > 1),]
+head(gwp.lgg.up)
+gwp.lgg.up <- id.table(gwp.lgg.up)
+#lgg gsea wikipathways down
+gwp.lgg.dn <- gwp.lgg[which(gwp.lgg$NES < -1),]
+head(gwp.lgg.dn)
+gwp.lgg.dn <- id.table(gwp.lgg.dn)
+
+## to collect all functional analysis results
+keep.colums.gsea <- c("ID","Description","pvalue","p.adjust","setSize","core_enrichment",
+                      "table.id","tool","cancer","regulation_proccess")
+fa.DEA1 <- rbind(fa.DEA1,
+                  setNames(gwp.gbm.up[,keep.colums.gsea], names(fa.DEA1)),
+                  setNames(gwp.gbm.dn[,keep.colums.gsea],names(fa.DEA1)),
+                  setNames(gwp.lgg.up[,keep.colums.gsea],names(fa.DEA1)),
+                  setNames(gwp.lgg.dn[,keep.colums.gsea],names(fa.DEA1)))
+```
+
+#### Gene Ontology (GO) functional analysis
+
+Gene ontology functional analysis with `clusterProfiler` functions `enrichGo` adn `gseGO`.
+Due to the parent-childhood annotation of GO terms, `dropGO` is applied to avoid general terms, eliminating higher levels of GO.
+Only biology proccess anotation is set for the analysis.
+
+##### ORA in GO
+
+```{r ORA in GO DEA1}
+#level to drop
+level.go <- 5
+
+### GBM
+## BIOLOGICAL PROCESS (BP)
+# ORA GO up BP
+ego.gbm.up <- enrichGO(gene = gbm.up.genelist$ENSEMBL,
+                          OrgDb = org.Hs.eg.db,
+                          keyType = 'ENSEMBL',
+                          ont = "BP",
+                          pAdjustMethod = "BH",
+                          pvalueCutoff  = 0.01,
+                          qvalueCutoff  = 0.05,
+                          readable = TRUE)
+
+ego.gbm.up <- setReadable(dropGO(ego.gbm.up,level = 1:level.go),
+                            org.Hs.eg.db, keyType = "ENTREZID")
+head(ego.gbm.up)
+ego.gbm.up <- id.table(ego.gbm.up)
+
+# ORA GO down BP
+ego.gbm.dn <- enrichGO(gene = gbm.dn.genelist$ENSEMBL,
+                          OrgDb = org.Hs.eg.db,
+                          keyType = 'ENSEMBL',
+                          ont = "BP",
+                          pAdjustMethod = "BH",
+                          pvalueCutoff  = 0.01,
+                          qvalueCutoff  = 0.05,
+                          readable = TRUE)
+ego.gbm.dn <- setReadable(dropGO(ego.gbm.dn,level = 1:level.go),
+                            org.Hs.eg.db, keyType = "ENTREZID")
+head(ego.gbm.dn)
+ego.gbm.dn <- id.table(ego.gbm.dn)
+
+### LGG
+## BIOLOGICAL PROCESS (BP)
+# ORA GO up BP
+ego.lgg.up <- enrichGO(gene = lgg.up.genelist$ENSEMBL,
+                          OrgDb = org.Hs.eg.db,
+                          keyType = 'ENSEMBL',
+                          ont = "BP",
+                          pAdjustMethod = "BH",
+                          pvalueCutoff  = 0.01,
+                          qvalueCutoff  = 0.05,
+                          readable = TRUE)
+
+ego.lgg.up <- setReadable(dropGO(ego.lgg.up,level = 1:level.go),
+                            org.Hs.eg.db, keyType = "ENTREZID")
+head(ego.lgg.up)
+ego.lgg.up <- id.table(ego.lgg.up)
+
+# ORA GO down BP
+ego.lgg.dn <- enrichGO(gene = lgg.dn.genelist$ENSEMBL,
+                          OrgDb = org.Hs.eg.db,
+                          keyType = 'ENSEMBL',
+                          ont = "BP",
+                          pAdjustMethod = "BH",
+                          pvalueCutoff  = 0.01,
+                          qvalueCutoff  = 0.05,
+                          readable = TRUE)
+ego.lgg.dn <- setReadable(dropGO(ego.lgg.dn,level = 1:level.go),
+                            org.Hs.eg.db, keyType = "ENTREZID")
+head(ego.lgg.dn)
+ego.lgg.dn <- id.table(ego.lgg.dn)
+
+
+
+## to collect all functional analysis results 
+fa.DEA1 <- rbind(fa.DEA1,
+                  ego.gbm.up[,keep.colums.enricher], 
+                  ego.gbm.dn[,keep.colums.enricher], 
+                  ego.lgg.up[,keep.colums.enricher], 
+                  ego.lgg.dn[,keep.colums.enricher]) 
+```
+
+
+##### GSEA in Gene Ontology
+
+
+```{r GSEA in GO DEA1, message=FALSE}
+set.seed(1234567)
+
+### GBM
+## BIOLOGICAL PROCESS (BP)
+# GSEA GO BP
+ggo.gbm.BP <- gseGO(geneList = c(gbm.up.gene,
+                                 gbm.dn.gene),
+                    OrgDb = org.Hs.eg.db,
+                    ont = "BP",
+                    pvalueCutoff = 0.05,
+                    eps = 0,
+                    verbose = FALSE)
+ggo.gbm.BP <- setReadable(ggo.gbm.BP,'org.Hs.eg.db', 'ENTREZID')
+
+#gbm gsea GO up
+ggo.gbm.up <- ggo.gbm.BP[which(ggo.gbm.BP$NES > 1),]
+head(ggo.gbm.up)
+ggo.gbm.up <- id.table(ggo.gbm.up)
+
+#gbm gsea GO down
+ggo.gbm.dn <- ggo.gbm.BP[which(ggo.gbm.BP$NES < -1),]
+head(ggo.gbm.dn)
+ggo.gbm.dn <- id.table(ggo.gbm.dn)
+
+### LGG
+## BIOLOGICAL PROCESS (BP)
+# GSEA GO BP
+ggo.lgg.BP <- gseGO(geneList = c(lgg.up.gene,
+                                 lgg.dn.gene),
+                    OrgDb = org.Hs.eg.db,
+                    ont = "BP",
+                    pvalueCutoff = 0.05,
+                    eps = 0,
+                    verbose = FALSE)
+ggo.lgg.BP <- setReadable(ggo.lgg.BP, 'org.Hs.eg.db', 'ENTREZID')
+
+#lgg gsea GO up
+ggo.lgg.up <- ggo.lgg.BP[which(ggo.lgg.BP$NES > 1),]
+head(ggo.lgg.up)
+ggo.lgg.up <- id.table(ggo.lgg.up)
+
+#lgg gsea GO down
+ggo.lgg.dn <- ggo.lgg.BP[which(ggo.lgg.BP$NES < -1),]
+head(ggo.lgg.dn)
+ggo.lgg.dn <- id.table(ggo.lgg.dn)
+
+## to collect all functional analysis results
+fa.DEA1 <- rbind(fa.DEA1,
+                  setNames(ggo.gbm.up[,keep.colums.gsea], names(fa.DEA1)),
+                  setNames(ggo.gbm.dn[,keep.colums.gsea],names(fa.DEA1)),
+                  setNames(ggo.lgg.up[,keep.colums.gsea],names(fa.DEA1)),
+                  setNames(ggo.lgg.dn[,keep.colums.gsea],names(fa.DEA1)))
+```
+
+#### Kyoto Encyclopedia of Genes and Genomes (KEGG) functional analysis
+
+Similar procedure was done with the KEGG database. In this case the functions are `enrichKEGG` and `gseKEGG` for ORA and GSEA analysis, respectively.
+
+##### ORA in KEGG
+
+```{r ORA in KEGG DEA1}
+### GBM
+# ORA KEGG up
+ekg.gbm.up <- enrichKEGG(gene = names(gbm.up.gene),
+                         organism = "hsa",
+                         pAdjustMethod = "BH",
+                         universe = names(gbm.all.gene),
+                         pvalueCutoff = 0.05)
+
+ekg.gbm.up <- setReadable(ekg.gbm.up, org.Hs.eg.db, keyType = "ENTREZID")
+head(ekg.gbm.up)
+ekg.gbm.up <- id.table(ekg.gbm.up)
+
+# ORA KEGG down
+ekg.gbm.dn <- enrichKEGG(gene = names(gbm.dn.gene),
+                         organism = "hsa",
+                         pAdjustMethod = "BH",
+                         universe = names(gbm.all.gene),
+                         pvalueCutoff = 0.05)
+
+ekg.gbm.dn <- setReadable(ekg.gbm.dn, org.Hs.eg.db, keyType = "ENTREZID")
+head(ekg.gbm.dn)
+ekg.gbm.dn <- id.table(ekg.gbm.dn)
+
+### LGG
+# ORA KEGG up
+ekg.lgg.up <- enrichKEGG(gene = names(lgg.up.gene),
+                         organism = "hsa",
+                         pAdjustMethod = "BH",
+                         universe = names(lgg.all.gene),
+                         pvalueCutoff = 0.05)
+
+ekg.lgg.up <- setReadable(ekg.lgg.up, org.Hs.eg.db, keyType = "ENTREZID")
+head(ekg.lgg.up)
+ekg.lgg.up <- id.table(ekg.lgg.up)
+
+# ORA KEGG down
+ekg.lgg.dn <- enrichKEGG(gene = names(lgg.dn.gene),
+                         organism = "hsa",
+                         pAdjustMethod = "BH",
+                         universe = names(lgg.all.gene),
+                         pvalueCutoff = 0.05)
+
+ekg.lgg.dn <- setReadable(ekg.lgg.dn, org.Hs.eg.db, keyType = "ENTREZID")
+head(ekg.lgg.dn)
+ekg.lgg.dn <- id.table(ekg.lgg.dn)
+
+
+## to collect all functional analysis results
+fa.DEA1 <- rbind(fa.DEA1,
+                  ekg.gbm.up[,keep.colums.enricher], 
+                  ekg.gbm.dn[,keep.colums.enricher], 
+                  ekg.lgg.up[,keep.colums.enricher], 
+                  ekg.lgg.dn[,keep.colums.enricher])
+```
+
+
+##### GSEA in KEGG
+
+
+```{r GSEA in KEGG DEA1}
+set.seed(1234567)
+
+##GBM
+#GSEA in KEGG
+gkg.gbm <- gseKEGG(geneList = c(gbm.up.gene,
+                                gbm.dn.gene),
+                   pAdjustMethod = "BH",
+                   pvalueCutoff = 0.05,
+                   verbose = FALSE
+                   )
+gkg.gbm <- setReadable(gkg.gbm, 'org.Hs.eg.db', 'ENTREZID')
+
+#gbm gsea kegg up
+gkg.gbm.up <- gkg.gbm[which(gkg.gbm$NES > 1),]
+head(gkg.gbm.up)
+gkg.gbm.up <- id.table(gkg.gbm.up)
+
+#gbm gsea kegg down
+gkg.gbm.dn <- gkg.gbm[which(gkg.gbm$NES < -1),]
+head(gkg.gbm.dn)
+gkg.gbm.dn <- id.table(gkg.gbm.dn)
+
+##lgg
+#GSEA in KEGG
+gkg.lgg <- gseKEGG(geneList = c(lgg.up.gene,
+                                lgg.dn.gene),
+                   pAdjustMethod = "BH",
+                   pvalueCutoff = 0.05,
+                   verbose = FALSE
+                   )
+gkg.lgg <- setReadable(gkg.lgg, 'org.Hs.eg.db', 'ENTREZID')
+
+#lgg gsea kegg up
+gkg.lgg.up <- gkg.lgg[which(gkg.lgg$NES > 1),]
+head(gkg.lgg.up)
+gkg.lgg.up <- id.table(gkg.lgg.up)
+
+#lgg gsea kegg down
+gkg.lgg.dn <- gkg.lgg[which(gkg.lgg$NES < -1),]
+head(gkg.lgg.dn)
+gkg.lgg.dn <- id.table(gkg.lgg.dn)
+
+fa.DEA1 <- rbind(fa.DEA1,
+                  setNames(gkg.gbm.up[,keep.colums.gsea],names(fa.DEA1)),
+                  setNames(gkg.gbm.dn[,keep.colums.gsea],names(fa.DEA1)),
+                  setNames(gkg.lgg.up[,keep.colums.gsea],names(fa.DEA1)),
+                  setNames(gkg.lgg.dn[,keep.colums.gsea],names(fa.DEA1)))
+writexl::write_xlsx(fa.DEA1, path = "DEAsets/fa.DEA1.xlsx")
+```
+
+
+#### Wordcloud functional analysis from DEA1
+
+In this section, different wordclouds are shown from proccesses and genes involved in the proccesses.
+
+```{r wordclouds FA1}
+### fuction to create tables and wordclouds of proccess and genes respectively
+proccess.table <- function(fa.table, database, cases, reg){
+  t <- fa.table
+  enrich <- paste("e",database, sep = "")
+  gsea <- paste("g",database, sep = "")
+  t <- t$Description[which(t$tool == enrich & t$cancer == cases & t$regulation_proccess == reg|
+                            t$tool == gsea & t$cancer == cases & t$regulation_proccess == reg)]
+  t <- as.data.frame(table(t))
+  t <- t[order(t$Freq,decreasing = TRUE),]
+  return <- (t)
+}
+
+#function to get wordcloud
+getwordcloud <- function(fa.table, database, cases, reg,  scale.w = c(1.8,.3)){
+  w <- fa.table
+  enrich <- paste("e",database, sep = "")
+  gsea <- paste("g",database, sep = "")
+  w <- w$geneID[which(w$tool == enrich & w$cancer == cases & w$regulation_proccess == reg|
+                        w$tool == gsea & w$cancer == cases & w$regulation_proccess == reg)]
+  w <- unlist(strsplit(w, "/"))
+  w <- as.data.frame(table(w))
+  wordcloud(words = w$w, freq = w$Freq,
+            min.freq = 4,max.words=50, random.order=FALSE, 
+            rot.per=0.35, scale= scale.w, colors=brewer.pal(8, "Dark2"))
+}
+
+#### Wordclouds for FA1 ####
+### acronyms
+## databases
+# wp = wikipathways
+# go = gene ontology
+# kg = KEGG
+##cases
+# gbm = GBM vs colon
+# lgg = LGG vs colon
+# gli = GBM vs LGG
+
+### WIKIPATHWAYS ####
+## GBM 
+#up-regulated
+fa.wp.gbm.up<- proccess.table(fa.table = fa.DEA1, 
+                           database = "wp", 
+                           cases = "gbm", 
+                           reg = "up")
+head(fa.wp.gbm.up)
+getwordcloud(fa.table = fa.DEA1, 
+             database = "wp",
+             cases = "gbm", 
+             reg = "up")
+#down-regulated
+fa.wp.gbm.dn<- proccess.table(fa.table = fa.DEA1, 
+                           database = "wp", 
+                           cases = "gbm", 
+                           reg = "dn")
+head(fa.wp.gbm.dn)
+getwordcloud(fa.table = fa.DEA1, 
+             database = "wp",
+             cases = "gbm", 
+             reg = "dn")
+
+## LGG
+#up
+fa.wp.lgg.up<- proccess.table(fa.table = fa.DEA1, 
+                           database = "wp", 
+                           cases = "lgg", 
+                           reg = "up")
+head(fa.wp.lgg.up)
+getwordcloud(fa.table = fa.DEA1, 
+             database = "wp",
+             cases = "lgg", 
+             reg = "up")
+#down-regulated
+fa.wp.lgg.dn<- proccess.table(fa.table = fa.DEA1, 
+                           database = "wp", 
+                           cases = "lgg", 
+                           reg = "dn")
+head(fa.wp.lgg.dn)
+getwordcloud(fa.table = fa.DEA1, 
+             database = "wp",
+             cases = "lgg", 
+             reg = "dn")
+
+
+## GENE ONTOLOGY ####
+## GBM 
+#up-regulated
+fa.go.gbm.up<- proccess.table(fa.table = fa.DEA1, 
+                           database = "go", 
+                           cases = "gbm", 
+                           reg = "up")
+head(fa.go.gbm.up)
+getwordcloud(fa.table = fa.DEA1, 
+             database = "go",
+             cases = "gbm", 
+             reg = "up")
+#down-regulated
+fa.go.gbm.dn<- proccess.table(fa.table = fa.DEA1, 
+                           database = "go", 
+                           cases = "gbm", 
+                           reg = "dn")
+head(fa.go.gbm.dn)
+getwordcloud(fa.table = fa.DEA1, 
+             database = "go",
+             cases = "gbm", 
+             reg = "dn",
+             scale.w = c(1,.2))
+
+## LGG
+#up
+fa.go.lgg.up<- proccess.table(fa.table = fa.DEA1, 
+                           database = "go", 
+                           cases = "lgg", 
+                           reg = "up")
+head(fa.go.lgg.up)
+getwordcloud(fa.table = fa.DEA1, 
+             database = "go",
+             cases = "lgg", 
+             reg = "up")
+#down-regulated
+fa.go.lgg.dn<- proccess.table(fa.table = fa.DEA1, 
+                           database = "go", 
+                           cases = "lgg", 
+                           reg = "dn")
+head(fa.go.lgg.dn)
+getwordcloud(fa.table = fa.DEA1, 
+             database = "go",
+             cases = "lgg", 
+             reg = "dn",
+             scale.w = c(1,.2))
+
+## KEGG ####
+## GBM 
+#up-regulated
+fa.kg.gbm.up<- proccess.table(fa.table = fa.DEA1, 
+                           database = "kg", 
+                           cases = "gbm", 
+                           reg = "up")
+head(fa.kg.gbm.up)
+getwordcloud(fa.table = fa.DEA1, 
+             database = "kg",
+             cases = "gbm", 
+             reg = "up")
+#down-regulated
+fa.kg.gbm.dn<- proccess.table(fa.table = fa.DEA1, 
+                           database = "kg", 
+                           cases = "gbm", 
+                           reg = "dn")
+head(fa.kg.gbm.dn)
+getwordcloud(fa.table = fa.DEA1, 
+             database = "kg",
+             cases = "gbm", 
+             reg = "dn")
+
+## LGG
+#up
+fa.kg.lgg.up<- proccess.table(fa.table = fa.DEA1, 
+                           database = "kg", 
+                           cases = "lgg", 
+                           reg = "up")
+head(fa.kg.lgg.up)
+getwordcloud(fa.table = fa.DEA1, 
+             database = "kg",
+             cases = "lgg", 
+             reg = "up")
+#down-regulated
+fa.kg.lgg.dn<- proccess.table(fa.table = fa.DEA1, 
+                           database = "kg", 
+                           cases = "lgg", 
+                           reg = "dn")
+head(fa.kg.lgg.dn)
+getwordcloud(fa.table = fa.DEA1, 
+             database = "kg",
+             cases = "lgg", 
+             reg = "dn")
+```
+
+
+# Analysis 2
+
+In the second analysis, we want to carry out an differential expression analysis between similar glioma cancer typology. Then, no colon cases will be use below.
+
+## Filtering
+
+Colon cases were removed and new factor group was created in this chunk.
+
+```{r sim dataset}
+#sim data, no colon cases
+sim_exprs <- raw_exprs[,which(group_f != "colon")]
+
+#groups for sim data
+group_s <- as.factor(as.character(
+    group_f[which(group_f != "colon")]))
+```
+
+### Signal Expression Filtering
+
+Similar procedure is used to do the signal expression filtering. CPM > 1 sets was employed.
+
+```{r SEF sim data}
+#for filtering purpose data are transformed to log-cpm
+myCPM <-cpm(sim_exprs)
+
+#mean and median of library sizes in M
+col_sum <- colSums(sim_exprs)
+mlib <- mean(col_sum) * 1e-6
+mlib
+medlib <- median(col_sum) * 1e-6
+medlib
+hist(col_sum * 1e-6, 
+     las= 2, col = "navyblue",
+     main="Histogram of library sizes analysis 2", 
+     xlab="Library size (M)")
+abline(v = mlib, col = "grey")
+abline(v = medlib, col = "red")
+
+### CPM equal to standard value 1
+# threshold to get upper values
+thresh <- myCPM > 1
+#cpm equal to 1 is a standard threshold
+
+# Genes which are retained are those whose cpm is 
+# above thresh in half of the minimum cases of the 
+# less abundant group cases
+#n samples retained
+keepn <- round(min(tabulate(group_f))*0.5,0)
+#genes to retain
+keepcpm <- rowSums(thresh) >= keepn
+#number of genes retained with cpm > 1 approach
+sum(keepcpm)
+#identifying retained genes
+keeprow <- attr(keepcpm,"names")[keepcpm==T]
+```
+
+
+
+```{r SEF sim data2}
+#filter dataset
+sim_exprs <- sim_exprs[keepcpm,]
+save(sim_exprs, file="data/sim_exprs.RData")
+
+#deleting variables
+rm(myCPM, thresh, keepcpm, keepn, keeprow, 
+   medlib,mlib,col_sum)
+```
+
+
+## Exploratory analyses
+
+#### Principal Component Analysis
+
+Again, as well as how they behave in a PCA:
+
+```{r pca sim data, cache=TRUE}
+set.seed(1234567)
+
+#### Optional
+## Reducing number of cases to reduce computational cost
+## If you want to reduce number of cases changes percent
+percent <- 1
+pca_samples_ids <- sort(sample(x =  1:length(colnames(sim_exprs)),
+                      size = length(colnames(sim_exprs))*percent,
+                      replace = FALSE))
+pca_group <- group_s[pca_samples_ids]
+
+#Proportion in the full and in the reduced datasets of PCA
+prop.table(table(pca_group))
+prop.table(table(group_s))
+
+#pca
+pca_s <- prcomp(t(sim_exprs[,pca_samples_ids]), 
+                center = TRUE, 
+                scale = FALSE)
+
+fig_pca.a2 <- fviz_pca_ind(pca_s,
+                    geom = "point",
+                    col.ind = pca_group
+                    )
+fig_pca.a2
+
+#deleting variables
+rm(pca_s)
+```
+
+## Normalization
+
+Normalization with edgeR and voom, as previously done in analysis 1.
+
+```{r DGE list sim data}
+#apply countstovoom function
+v.S <- countstovoom(sim_exprs, group_s)
+save(v.S, file="data/v.S.RData")
+```
+
+
+### Exploratory analysis after Normalization
+
+#### Principal components analysis
+
+How are they after normalization proccess? 
+
+```{r pca normalized sim data}
+#pca function 
+pcanorm_s <- prcomp(t(v.S$E[,pca_samples_ids]), 
+                    center = TRUE, 
+                    scale = FALSE)
+
+#pca plot
+fig_pcanorm.a2 <- fviz_pca_ind(pcanorm_s,
+                    geom = "point",
+                    col.ind = pca_group)
+fig_pcanorm.a2
+
+#deleting variables
+rm(pcanorm_s, pca_group, pca_samples_ids)
+```
+
+## Linear Model
+
+Again, `linmod` to create the linear model.
+
+```{r Linear model sim data}
+#Building linear model 
+fit.cont.S <- linmod(voomobj = v.S,
+                   group = group_s,
+                   contrast.mod = as.character(c("gbm-lgg"))
+                   )
+save(fit.cont.S, file="data/fit.cont.S.RData")
+```
+
+## DE analysis 2
+
+In this second DE analysis GBM is compared with LGG. So reference levels are taken for LGG and GBM face to this gene-expression levels.
+
+```{r DEA 2 sim data}
+#DEG based on treat function procedure
+fit.treat.S <- treat(fit.cont.S,lfc=2)
+res.treat.S <- decideTests(fit.treat.S)
+
+#Annotation for fit.treat object
+ann <- AnnotationDbi::select(org.Hs.eg.db,
+                             keys=rownames(fit.treat.S),
+                             keytype= "ENSEMBL",
+                             columns=c("ENTREZID","SYMBOL","GENENAME"),
+                             multiVals="first")
+
+#removing duplicated in the samples
+ann <- ann[!duplicated(ann$ENSEMBL),]
+
+#adding gen labels to fit.treat_genes
+fit.treat.S$genes <- ann
+
+#GBM vs LGG
+topGLIOMA <- topTreat(fit.treat.S,
+                   coef= "gbm-lgg",
+                   sort.by= "logFC",
+                   number = sum(summary(
+                       res.treat.S)[,"gbm-lgg"]))
+rownames(topGLIOMA) <- NULL
+
+#potential biomarkers of GBM
+head(topGLIOMA, 10)
+
+#savedata
+writexl::write_xlsx(topGLIOMA, path = "DEAsets/topGLIOMA.xlsx")
+save(topGLIOMA, file = "data/topGLIOMA.RData")
+
+#Sum up of all the DEG for comparisons.
+summary(res.treat.S)
+
+#deleting variables
+rm(ann, fit.cont.S)
+```
+
+### DE genes plots
+
+#### MD plot
+
+Mean-difference plots as a results of the DEA.
+
+```{r MD plots sim data}
+#MD gbm vs lgg
+plotMD(fit.treat.S,coef=1,
+       status=res.treat.S[,"gbm-lgg"], 
+       values=c(-1,1),
+       main = "GBM vs LGG",
+       cex = 0.1,
+       legend = FALSE)
+  abline(h=0,col="grey")
+```
+
+
+#### Gene sets of DEA2
+
+This chunk consiste on create gene sets for functional analysis afterwards.
+
+```{r Gene sets from sim data DEA2}
+p.value <- .05
+log.FC <- 2
+IDgene <- c("ENTREZID", "ENSEMBL","SYMBOL")
+parameter <- c("logFC", "adj.P.Val")
+
+##GLIOMA genesets
+#universe geneset
+gli.all.genelist <- topGLIOMA[,c(IDgene,parameter)]
+gli.all.gene <- gli.all.genelist[,"logFC"]
+names(gli.all.gene) <- as.character(gli.all.genelist[,"ENTREZID"])
+gli.all.gene <- sort(gli.all.gene, decreasing = TRUE)
+
+#up geneset
+gli.up.genelist <- topGLIOMA[topGLIOMA$adj.P.Val < p.value & topGLIOMA$logFC > log.FC,
+                      c(IDgene,parameter)]
+gli.up.gene <- gli.up.genelist[,"logFC"]
+names(gli.up.gene) <- as.character(gli.up.genelist[,"ENTREZID"])
+gli.up.gene <- sort(gli.up.gene, decreasing = TRUE)
+#down geneset
+gli.dn.genelist <- topGLIOMA[topGLIOMA$adj.P.Val < p.value & topGLIOMA$logFC < log.FC,
+                      c(IDgene,parameter)]
+gli.dn.gene <- gli.dn.genelist[,"logFC"]
+names(gli.dn.gene) <- as.character(gli.dn.genelist[,"ENTREZID"])
+gli.dn.gene <- sort(gli.dn.gene, decreasing = TRUE)
+```
+
+#### Venn Diagram
+
+Venn diagram plot in this second analysis was done with all of the result from the analysis 1 and with the results of the second analysis. Again up and down-regulated genes are separated.
+
+```{r venn Diagram sim data}
+#list for venn diagram
+venn_list2 <- list(a1.up = unique(c(gbm.up.genelist$ENSEMBL,
+                                    lgg.up.genelist$ENSEMBL)),
+                   a1.dn = unique(c(gbm.dn.genelist$ENSEMBL,
+                                    lgg.dn.genelist$ENSEMBL)),
+                   gli.up = gli.up.genelist$ENSEMBL,
+                   gli.dn = gli.dn.genelist$ENSEMBL)
+
+v.table2 <- venn(data = venn_list2,
+                universe = gli.all.genelist$ENSEMBL,
+                small=0.7, showSetLogicLabel=FALSE,
+                show.plot=FALSE, intersections=TRUE,
+                names = c("analysis 1 up",
+                          "analysis 1 down",
+                          "GBM vs LGG up",
+                          "GBM vs LGG down")
+)
+isect2 <- attr(v.table2, "intersection")
+
+par(mfrow=c(1,1))
+#venn diagram
+ggvenn(venn_list2, 
+       fill_color = brewer.pal(8, "Dark2"),
+       stroke_size = 0.2, set_name_size = 4.5,
+       text_size = 3.5)
+```
+
+
+### Specific genes as potential biomarkers of GBM and LGG
+
+Previous `TOPGLIOMA` dataset can be taken as a list of potential biomarkers but in this section we explore the groups represented in the Venn diagram which are exclusive for some reason.
+
+```{r specific genes as potential biomarkers of GBM and LGG}
+#specific genes for up and down regulation in GBM excluding common genes with analysis 1
+gbm.specific2 <- c(isect2[["GBM vs LGG up"]],isect2[["GBM vs LGG down"]])
+length(gbm.specific2)
+gbm.specific.table2 <- topGLIOMA[topGLIOMA$ENSEMBL %in% gbm.specific2,]
+head(gbm.specific.table2)
+
+#specific genes for up and down regulation in GBM and up and down analysis 1, respectively
+gbm.equal.a1 <- c(isect2[["analysis 1 up:GBM vs LGG up"]],isect2[["analysis 1 down:GBM vs LGG down"]])
+length(gbm.equal.a1)
+gbm.equal.a1.table <- topGLIOMA[topGLIOMA$ENSEMBL %in% gbm.equal.a1,]
+head(gbm.equal.a1.table)
+
+#specific genes for up and down regulation in GBM and down and up analysis 1, respectively
+gbm.vic.a1 <- c(isect2[["analysis 1 down:GBM vs LGG up"]],isect2[["analysis 1 up:GBM vs LGG down"]])
+length(gbm.vic.a1)
+gbm.vic.a1.table <- topGLIOMA[topGLIOMA$ENSEMBL %in% gbm.vic.a1,]
+head(gbm.vic.a1.table)
+```
+
+### Functional analysis DEA2
+
+Similar procedure as functional analysis in DEA1
+
+#### rWikipatways functional analysis
+
+
+##### ORA analysis with wikipathways
+
+
+```{r ORA in rwikipathways DEA2}
+### GBM vs LGG 
+#ORA pathway up
+ewp.gli.up <- enricher(gene = names(gli.up.gene),
+                       universe = names(gli.all.gene),
+                       pAdjustMethod = "BH",
+                       pvalueCutoff = .1,
+                       TERM2GENE = wpid2gene,
+                       TERM2NAME = wpid2name)
+ewp.gli.up <- DOSE::setReadable(ewp.gli.up, org.Hs.eg.db, keyType = "ENTREZID")
+head(ewp.gli.up)
+p1<-barplot(ewp.gli.up, 
+            showCategory = 7, 
+            font.size = 7,
+            label_format = 15)+
+  ggtitle("GBM vs LGG DEG up")
+ewp.gli.up <- id.table(ewp.gli.up)
+
+
+
+#ORA pathway dn
+ewp.gli.dn <- enricher(gene = names(gli.dn.gene),
+                       universe = names(gli.all.gene),
+                       pAdjustMethod = "BH",
+                       pvalueCutoff = .1,
+                       TERM2GENE = wpid2gene,
+                       TERM2NAME = wpid2name)
+ewp.gli.dn <- DOSE::setReadable(ewp.gli.dn, org.Hs.eg.db, keyType = "ENTREZID")
+head(ewp.gli.dn)
+p2<-barplot(ewp.gli.dn,            
+            showCategory = 7, 
+            font.size = 7,
+            label_format = 15)+
+  ggtitle("GBM vs LGG DEG down")
+ewp.gli.dn <- id.table(ewp.gli.dn,size = 1)
+
+#plot grid for results
+pt <- plot_grid(p1, p2,ncol = 2)
+
+## to collect all functional analysis results
+fa.DEA2 <- rbind(ewp.gli.up[,keep.colums.enricher],
+                 ewp.gli.dn[,keep.colums.enricher])
+```
+
+##### GSEA analysis with wikipathways
+
+```{r GSEA in rwikpathways DEA2}
+set.seed(1234567)
+## GBM vs LGG GSEA
+gwp.gli <- GSEA(geneList = c(gli.up.gene,
+                             gli.dn.gene),
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.1,
+                TERM2GENE = wpid2gene,
+                TERM2NAME = wpid2name,
+                verbose = FALSE
+                   )
+gwp.gli <- setReadable(gwp.gli, 'org.Hs.eg.db', 'ENTREZID')
+
+#gbm vs lgg gsea wikipathways up
+gwp.gli.up <- gwp.gli[which(gwp.gli$NES > 1),]
+head(gwp.gli.up)
+gwp.gli.up <- id.table(gwp.gli.up, size = 1)
+
+#gbm vs lgg gsea wikipathways down
+gwp.gli.dn <- gwp.gli[which(gwp.gli$NES < -1),]
+head(gwp.gli.dn)
+#gwp.gli.dn <- id.table(gwp.gli.dn) #no results
+
+
+fa.DEA2 <- rbind(fa.DEA2,
+                 setNames(gwp.gli.up[,keep.colums.gsea],names(fa.DEA2)))
+# no results     setNames(gwp.gli.dn[,keep.colums.gsea],names(fa.DEA2)))
+```
+
+#### Gene Ontology (GO) functional analysis
+
+Gene ontology functional analysis with `clusterProfiler` functions `enrichGo` adn `gseGO`.
+Due to the parent-childhood annotation of GO terms, `dropGO` is applied to avoid general terms, eliminating higher levels of GO.
+
+##### ORA in GO
+
+```{r ORA in GO DEA2}
+#level to drop
+level.go <- 3
+
+### GBM vs LGG
+## BIOLOGICAL PROCESS (BP)
+# ORA GO up BP
+ego.gli.up <- enrichGO(gene = gli.up.genelist$ENSEMBL,
+                          OrgDb = org.Hs.eg.db,
+                          keyType = 'ENSEMBL',
+                          ont = "BP",
+                          pAdjustMethod = "BH",
+                          pvalueCutoff  = 0.05,
+                          readable = TRUE)
+
+ego.gli.up <- setReadable(dropGO(ego.gli.up,level = 1:level.go),
+                            org.Hs.eg.db, keyType = "ENTREZID")
+head(ego.gli.up)
+ego.gli.up <- id.table(ego.gli.up)
+
+# ORA GO down BP
+ego.gli.dn <- enrichGO(gene = gli.dn.genelist$ENSEMBL,
+                          OrgDb = org.Hs.eg.db,
+                          keyType = 'ENSEMBL',
+                          ont = "BP",
+                          pAdjustMethod = "BH",
+                          pvalueCutoff  = 0.05,
+                          readable = TRUE)
+ego.gli.dn <- setReadable(dropGO(ego.gli.dn,level = 1:level.go),
+                            org.Hs.eg.db, keyType = "ENTREZID")
+head(ego.gli.dn)
+ego.gli.dn <- id.table(ego.gli.dn)
+
+
+
+## to collect all functional analysis results 
+fa.DEA2 <- rbind(fa.DEA2,
+                  ego.gli.up[,keep.colums.enricher], 
+                  ego.gli.dn[,keep.colums.enricher])
+```
+
+
+##### GSEA in GO
+
+```{r GSEA in GO DEA2, message=FALSE}
+set.seed(1234567)
+
+### GBM vs LGG
+## BIOLOGICAL PROCESS (BP)
+# GSEA GO BP
+ggo.gli.BP <- gseGO(geneList = c(gli.up.gene,
+                                 gli.dn.gene),
+                    OrgDb = org.Hs.eg.db,
+                    ont = "BP",
+                    pvalueCutoff = 0.05,
+                    verbose = FALSE)
+ggo.gli.BP <- setReadable(ggo.gli.BP, 'org.Hs.eg.db', 'ENTREZID')
+
+#gbm vs lgg gsea GO up
+ggo.gli.up <- ggo.gli.BP[which(ggo.gli.BP$NES > 1),]
+head(ggo.gli.up)
+ggo.gli.up <- id.table(ggo.gli.up)
+
+#gbm vs lgg gsea GO down
+ggo.gli.dn <- ggo.gli.BP[which(ggo.gli.BP$NES < -1),]
+head(ggo.gli.dn)
+ggo.gli.dn <- id.table(ggo.gli.dn)
+
+
+
+## to collect all functional analysis results
+fa.DEA2 <- rbind(fa.DEA2,
+                  setNames(ggo.gli.up[,keep.colums.gsea],names(fa.DEA2)),
+                  setNames(ggo.gli.dn[,keep.colums.gsea],names(fa.DEA2)))
+```
+
+
+#### Kyoto Encyclopedia of Genes and Genomes (KEGG) functional analysis
+
+##### ORA in KEGG
+
+```{r ORA in KEGG DEA2}
+### GBM vs LGG
+# ORA KEGG up
+ekg.gli.up <- enrichKEGG(gene = names(gli.up.gene),
+                         organism = "hsa",
+                         pAdjustMethod = "BH",
+                         universe = names(gli.all.gene),
+                         pvalueCutoff = 0.05)
+
+ekg.gli.up <- setReadable(ekg.gli.up, org.Hs.eg.db, keyType = "ENTREZID")
+head(ekg.gli.up)
+ekg.gli.up <- id.table(ekg.gli.up, size = 16)
+
+# ORA KEGG down
+ekg.gli.dn <- enrichKEGG(gene = names(gli.dn.gene),
+                         organism = "hsa",
+                         pAdjustMethod = "BH",
+                         universe = names(gli.all.gene),
+                         pvalueCutoff = 0.05)
+
+ekg.gli.dn <- setReadable(ekg.gli.dn, org.Hs.eg.db, keyType = "ENTREZID")
+head(ekg.gli.dn)
+ekg.gli.dn <- id.table(ekg.gli.dn, size = 2)
+
+## to collect all functional analysis results
+fa.DEA2 <- rbind(fa.DEA2,
+                  ekg.gli.up[,keep.colums.enricher], 
+                  ekg.gli.dn[,keep.colums.enricher])
+```
+
+
+##### GSEA in KEGG
+
+
+```{r GSEA in KEGG DEA2}
+set.seed(1234567)
+
+##GBM vs LGG
+#GSEA in KEGG
+gkg.gli <- gseKEGG(geneList = c(gli.up.gene,
+                                gli.dn.gene),
+                   organism = "hsa",
+                   pAdjustMethod = "BH",
+                   pvalueCutoff = 0.05,
+                   verbose = FALSE
+                   )
+gkg.gli <- setReadable(gkg.gli, 'org.Hs.eg.db', 'ENTREZID')
+
+#gbm vs lgg gsea kegg up
+gkg.gli.up <- gkg.gli[which(gkg.gli$NES > 1),]
+head(gkg.gli.up)
+#gkg.gli.up <- id.table(gkg.gli.up) # no results
+
+#gbm vs lgg gsea kegg down
+gkg.gli.dn <- gkg.gli[which(gkg.gli$NES < -1),]
+head(gkg.gli.dn)
+gkg.gli.dn <- id.table(gkg.gli.dn, size = 1)
+
+
+fa.DEA2 <- rbind(fa.DEA2,
+                 #setNames(gwp.gli.up[,keep.colums.gsea], names(fa.DEA2)),
+                 setNames(gkg.gli.dn[,keep.colums.gsea],names(fa.DEA2)))
+writexl::write_xlsx(fa.DEA2, path = "DEAsets/fa.DEA2.xlsx")
+```
+
+#### Wordcloud functional analysis from DEA2
+
+As the same as analysis 1, in this section different wordclouds are shown from proccess and genes involve in the proccess.
+
+```{r wordclouds FA2}
+#### Wordclouds for FA2 ####
+### acronyms
+## databases
+# wp = wikipathways
+# go = gene ontology
+# kg = KEGG
+##cases
+# gbm = GBM vs colon
+# lgg = LGG vs colon
+# gli = GBM vs LGG
+
+### WIKIPATHWAYS ####
+## GLIOMAS: GBM vs LGG
+#up-regulated
+fa.wp.gli.up.2<- proccess.table(fa.table = fa.DEA2, 
+                           database = "wp", 
+                           cases = "gli", 
+                           reg = "up")
+head(fa.wp.gli.up.2)
+getwordcloud(fa.table = fa.DEA2, 
+             database = "wp",
+             cases = "gli", 
+             reg = "up")
+#down-regulated
+fa.wp.gli.dn.2<- proccess.table(fa.table = fa.DEA2, 
+                           database = "wp", 
+                           cases = "gli", 
+                           reg = "dn")
+head(fa.wp.gli.dn.2)
+getwordcloud(fa.table = fa.DEA2, 
+             database = "wp",
+             cases = "gli", 
+             reg = "dn")
+
+## GENE ONTOLOGY ####
+## GLIOMAS: GBM vs LGG
+#up-regulated
+fa.go.gli.up.2<- proccess.table(fa.table = fa.DEA2, 
+                           database = "go", 
+                           cases = "gli", 
+                           reg = "up")
+head(fa.go.gli.up.2)
+getwordcloud(fa.table = fa.DEA2, 
+             database = "go",
+             cases = "gli", 
+             reg = "up")
+#down-regulated
+fa.go.gli.dn.2<- proccess.table(fa.table = fa.DEA2, 
+                           database = "go", 
+                           cases = "gli", 
+                           reg = "dn")
+head(fa.go.gli.dn.2)
+getwordcloud(fa.table = fa.DEA2, 
+             database = "go",
+             cases = "gli", 
+             reg = "dn")
+
+## KEGG ####
+## GLIOMAS: GBM vs LGG
+#up-regulated
+fa.kg.gli.up.2<- proccess.table(fa.table = fa.DEA2, 
+                           database = "kg", 
+                           cases = "gli", 
+                           reg = "up")
+head(fa.kg.gli.up.2)
+getwordcloud(fa.table = fa.DEA2, 
+             database = "kg",
+             cases = "gli", 
+             reg = "up")
+#down-regulated
+fa.kg.gli.dn.2<- proccess.table(fa.table = fa.DEA2, 
+                           database = "kg", 
+                           cases = "gli", 
+                           reg = "dn")
+head(fa.kg.gli.dn.2)
+getwordcloud(fa.table = fa.DEA2, 
+             database = "kg",
+             cases = "gli", 
+             reg = "dn")
+```
+
+
+# Machine Learning analysis
+
+In this section are run several algorithms of machine learning with a classification aim. The algorithms are the following:
+
+From supervised analysis method:  
+  + K nearest neighbourhood 
+  + Artificial Neural Network 
+  + Support Vector Machine
+  + Random Forest
+  
+From non-supervised analysis method:
+  + k mean
+  + hierarchical clustering
+  + Gaussian 
+
+Every algorithms will be run with different gene sets and also contains internal parameter which will be adjusted. Four analysis are done with each algorithm:  
+  + All genes from analysis 1: GBM, LGG and colon cases.  
+  + DEG for analysis 1: GBM vs colon and LGG vs colon DEA1. 
+  + All genes for analysis 2: GBM and LGG cases.  
+  + DEG for analysis 2: GBM vs LGG DEA2.  
+
+```{r ML packages, message=FALSE}
+library(caret) #evaluation
+library(kableExtra) #tables
+library(class)#knn
+library(mclust) #GBM
+library(dbscan)
+```
+
+
+The next chunk is optional to reduce the number of cases for the algorithm execution.
+Cases could be reduced due to computational cost. It is optional but it's also recommended for high-cost computational algorithm.
+
+```{r reduce cases for ML algorithm}
+##Case reduction for ML analysis is optional
+set.seed(987654321)
+#optional percentage
+percent <- 1
+
+#Cases for FULL data
+clust.ids.F <- sort(sample(x =  1:length(colnames(v.F$E)),
+                      size = length(colnames(v.F$E))*percent,
+                      replace = FALSE))
+clust.F <- group_f[clust.ids.F]
+prop.table(table(clust.F))
+prop.table(table(group_f))
+
+#Cases for SIM data
+clust.ids.S <- which(clust.ids.F <= length(colnames(v.S$E)))
+clust.S <- group_s[clust.ids.S]
+
+##Assigning number case for patients
+#it will be used for plots in ML analysis
+# FULL data
+patients.id <- c(paste(levels(group_f)[2], 1:length(group_f[which(group_f == "gbm")]),sep = "_"),
+                 paste(levels(group_f)[3], 1:length(group_f[which(group_f == "lgg")]),sep = "_"),
+                 paste(levels(group_f)[1], 1:length(group_f[which(group_f == "colon")]),sep = "_")
+)
+colnames(v.F$E) <- patients.id
+
+#SIM data
+patients.id <- patients.id[1:length(group_s)]
+colnames(v.S$E) <- patients.id
+```
+
+
+Moreover, we need to define some genesets for the ML analysis
+
+
+```{r gene sets for ML analysis}
+#ALL genes from analysis 1
+all.a1 <- gbm.all.genelist$ENSEMBL
+
+#Differential expresed genes from DEA1
+deg.a1 <- unique(c(gbm.up.genelist$ENSEMBL,
+                   gbm.dn.genelist$ENSEMBL,
+                   lgg.up.genelist$ENSEMBL,
+                   lgg.dn.genelist$ENSEMBL
+                   )
+                 )
+length(deg.a1)
+
+#ALL genes from analysis 2
+all.a2 <- gli.all.genelist$ENSEMBL
+
+#Differential expresed genes from DEA2
+deg.a2 <- unique(c(gli.up.genelist$ENSEMBL,
+                     gli.dn.genelist$ENSEMBL
+                     )
+                   )
+length(deg.a2)
+```
+
+
+```{r function and variables to work with in ML}
+#variables to save supervised analysis
+reset.var.s <- function(){
+  cont.mat <<- data.frame()
+  parametro <<- c()
+  accuracy <<- c()
+  kappa.e <<- c()
+}
+```
+
+## Machine Learning for analysis 1
+
+
+
+```{r variables for analysis 1}
+#This chunk save a variable for the supervised analysis.
+#col_cont.mat
+str_cancer <- c("colon","gbm","lgg")
+count <- 1
+col_cont.mat <- c()
+for (i in 1:3){
+  for (j in 1:3){
+    col_cont.mat[count] <- paste(str_cancer[i],str_cancer[j], sep = "_as_")
+    count <- count + 1
+  }
+}
+```
+
+
+### Supervised analysis method
+
+For supervised analysis 1 we need to build train and test dataset.
+
+```{r train and test dataset for supervised analysis}
+#### Building training and test dataset.
+#dataset train and test
+set.seed(123456789)
+
+#numbers of data for each dataset
+n_train <- round(0.67*length(clust.F),0)
+n_test <- round(0.33*length(clust.F),0)
+
+#ids for each dataset
+train_ids <- sort(sample(x = 1:length(clust.F),size = n_train,replace = FALSE))
+test_ids <- c(1:length(clust.F))[-train_ids]
+
+#building training and test dataset
+train_data <- list(all.F = v.F$E[all.a1,train_ids],
+                   DEG.F = v.F$E[deg.a1,train_ids])
+test_data <- list(all.F = v.F$E[all.a1,test_ids],
+                   DEG.F = v.F$E[deg.a1,test_ids])
+
+#labelling dataset
+train_label <- clust.F[train_ids]
+test_label <- clust.F[test_ids]
+
+#proportions
+#train dataset
+round(prop.table(table(train_label)),3)*100
+#test dataset
+round(prop.table(table(test_label)),3)*100
+#dataset
+round(prop.table(table(clust.F)),3)*100
+
+#short function to extract data train and test
+getset <- function(set){
+  train <- train_data[[set]]
+  test <- test_data[[set]]
+  data <- list(train = train,
+               test = test)
+  return(data)
+}
+```
+
+
+#### K nearest neighbourhood (Knn)
+
+
+```{r knn ML a1 FULL data}
+### Knn algorithm
+#Evaluating models with different k values (neighbours)
+ks <- c(3,5)
+
+#function to evaluate knn models
+eval.knn <-function(model, geneset, n.mod,
+                      cm = cont.mat,parameter.e = parametro, 
+                      accuracy.e = accuracy, kappa = kappa.e){
+  modelos <- c(rep(model,n.mod))
+  gens <- c(rep(geneset,n.mod))
+  resum <- data.frame(modelos, parameter.e, gens,
+                    round(accuracy.e,3), round(kappa.e,3), 
+                    cont.mat)
+  names(resum) <- c("model", "parameter", "geneset", 
+                  "accuracy", "kappa", col_cont.mat)
+  return(resum)
+}
+
+#### DATA all.F ####
+## ALL genes analysis FULL data
+data <- getset(set = "all.F")
+
+#reseting variables
+reset.var.s()
+
+#for loop to execute knn algorithm with differen k values
+j <- 0 #counter
+for (i in ks){
+  j <- j +1 #add 1 to counter
+  #execution of knn value k = i
+  test_pred <- knn(train = t(data$train), 
+                   test = t(data$test), 
+                   cl = train_label, 
+                   k=i, 
+                   prob = TRUE)
+  
+  #confusion matrix
+  conf_knn <- confusionMatrix(test_pred, test_label)
+  
+  #variables of confusion matrix to save the model
+  parametro[j] <- paste("k = ", i)
+  cont.mat<- rbind(cont.mat, c(conf_knn[["table"]]))
+  accuracy[j] <- conf_knn[["overall"]][["Accuracy"]]
+  kappa.e[j] <- conf_knn[["overall"]][["Kappa"]]
+}
+
+#evaluation
+resum <- eval.knn(model = "kNN",
+                  n.mod = 2,
+                  geneset = "ALL",
+                  parameter.e = parametro,
+                  kappa = kappa.e)
+#tabla from knn
+knn.all.F <- resum
+knn.all.F
+
+
+
+#### DATA DEG.F ####
+## DEG genes analysis FULL data
+data <- getset(set = "DEG.F")
+
+#reseting variables
+reset.var.s()
+
+#for loop to execute knn algorithm with differen k values
+j <- 0 #counter
+for (i in ks){
+  j <- j +1 #add 1 to counter
+  #execution of knn value k = i
+  test_pred <- knn(train = t(data$train), 
+                   test = t(data$test), 
+                   cl = train_label, 
+                   k=i, 
+                   prob = TRUE)
+  
+  #confusion matrix
+  conf_knn <- confusionMatrix(test_pred, test_label)
+  
+  #variables of confusion matrix to save the model
+  parametro[j] <- paste("k = ", i)
+  cont.mat<- rbind(cont.mat, c(conf_knn[["table"]]))
+  accuracy[j] <- conf_knn[["overall"]][["Accuracy"]]
+  kappa.e[j] <- conf_knn[["overall"]][["Kappa"]]
+}
+
+#evaluation
+#evaluation for models of knn
+
+resum <- eval.knn(model = "kNN",
+                  n.mod = 2,
+                  geneset = "DEG",
+                  parameter.e = parametro,
+                  kappa = kappa.e)
+#tabla from knn
+knn.DEG.F <- resum
+knn.DEG.F
+```
+
+
+### Non-Supervised analysis method
+
+#### K mean
+
+```{r kmean ML a1 FULL data}
+### Kmean algorithm
+#function to evaluate kmean models
+eval.km <- function(result, group.clust,
+                    geneset, parameter.e,
+                    model = "kmeans"){
+  kmeans <- result
+  group <- group.clust
+                    
+  #assign each cluster with the level group
+  km_eval <- data.frame(cluster = kmeans,
+                        group = group)
+
+  levels_new_group <- c()
+  for (i in 1:3){
+    km_eval$new_group[km_eval$group == levels(group)[i]] <- 
+      which.max(tabulate(km_eval$cluster[km_eval$group == levels(group)[i]]))
+  }
+  for (i in 1:3){
+    levels_new_group[i] <- as.character(km_eval$group[which(km_eval$new_group == i)])[2]
+  }
+  
+  actual_label <- factor(km_eval$group, levels = levels_new_group)
+  predict_cluster <- as.factor(km_eval$cluster)
+  levels(predict_cluster) <- levels_new_group
+
+  #reseting variables
+  reset.var.s()
+  
+  #to evaluate confusionmatrix
+  con_mat <- confusionMatrix(predict_cluster,actual_label)
+  cont.mat<- rbind(cont.mat,c(con_mat[["table"]]))
+  accuracy <- con_mat[["overall"]][["Accuracy"]]
+  kappa.e <- con_mat[["overall"]][["Kappa"]]
+
+  #resumen
+  resum <- data.frame(model, parameter.e, geneset,
+                    round(accuracy,3), round(kappa.e,3), 
+                    cont.mat)
+  cont.mat_names <- c()
+  for (col in colnames(con_mat[["table"]])){
+    for (row in rownames(con_mat[["table"]])){
+      cont.mat_names <- append(cont.mat_names, paste(col, "as", row))
+    }
+  }
+  names(resum) <- c("model", "parameter","geneset",
+                  "accuracy", "kappa",cont.mat_names)
+  return(resum)
+}
+
+#### DATA all.F ####
+## ALL genes analysis FULL data
+data <- t(v.F$E[all.a1, clust.ids.F])
+
+#k mean execution
+set.seed(666333666)
+km <- kmeans(data,centers = 3) #three groups
+fig_clus<- fviz_cluster(object = km,
+             data = data,
+             geom = c("text"),
+             labelsize = 7,
+             ggtheme = theme_bw(),
+             main = paste())
+fig_clus
+
+##Evaluation
+
+
+resum <- eval.km(result = km$cluster,
+                 group.clust = clust.F,
+                 geneset = "ALL",parameter.e = "3 groups")
+
+#kmean table
+kme.all.F <- resum
+kme.all.F
+
+#### DATA DEG.F ####
+## ALL genes analysis FULL data
+data <- t(v.F$E[deg.a1, clust.ids.F])
+
+#k mean execution
+set.seed(666333666)
+km <- kmeans(data,centers = 3) #three groups
+fig_clus<- fviz_cluster(object = km,
+                        data = data,
+                        geom = c("text"),
+                        labelsize = 7,
+                        ggtheme = theme_bw(),
+                        main = paste())
+fig_clus
+
+##Evaluation
+
+
+resum <- eval.km(result = km$cluster,
+                 group.clust = clust.F,
+                 geneset = "DEG",parameter.e = "3 groups")
+
+
+#kmean table
+kme.DEG.F <- resum
+kme.DEG.F
+```
+
+
+#### Hierarchical clustering
+
+
+```{r hc ML a1 FULL data}
+#### Hierarchical clustering
+
+#### DATA all.F ####
+## ALL genes analysis FULL data
+data <- t(v.F$E[all.a1, clust.ids.F])
+
+set.seed(123)
+d <- dist(data, method = "euclidean")
+# Hierarchical clustering using Complete Linkage
+hc <- hclust(d, method = "ward.D" )
+# Cut tree into 3 groups
+sub_grp <- cutree(hc, k = 3)
+
+# Plot full dendogram
+fig_hc <-fviz_dend(
+  hc,
+  k = 3,
+  horiz = FALSE,
+  rect = TRUE,
+  rect_fill = TRUE,
+  rect_border = "jco",
+  k_colors = "jco",
+  cex = 0.3
+)
+fig_hc
+
+#evaluation
+#function of evaluation of km model can be used here
+resum <- eval.km(result = sub_grp, group.clust = clust.F,
+                 geneset = "ALL",parameter.e = "cutree 3",
+                 model = "hclust")
+
+hcl.all.F <- resum
+hcl.all.F
+
+#### DATA DEG.F ####
+## DEG genes analysis FULL data
+data <- t(v.F$E[deg.a1, clust.ids.F])
+
+set.seed(123)
+d <- dist(data, method = "euclidean")
+# Hierarchical clustering using Complete Linkage
+hc <- hclust(d, method = "ward.D" )
+# Cut tree into 3 groups
+sub_grp <- cutree(hc, k = 3)
+
+# Plot full dendogram
+fig_hc <-fviz_dend(
+  hc,
+  k = 3,
+  horiz = FALSE,
+  rect = TRUE,
+  rect_fill = TRUE,
+  rect_border = "jco",
+  k_colors = "jco",
+  cex = 0.3
+)
+fig_hc
+
+#evaluation
+#function of evaluation of km model can be used here
+resum <- eval.km(result = sub_grp, group.clust = clust.F,
+                 geneset = "DEG",parameter.e = "cutree 3",
+                 model = "hclust")
+
+hcl.DEG.F <- resum
+hcl.DEG.F
+```
+
+
+#### Gaussian Mixture Model (GMM)
+
+For GMM and all genes dataset algorith couln't be implemented due to stack overflow related problem.
+
+```{r GMM ML a1 FULL data}
+#### Gaussian Mixture Model
+
+#### DATA all.F ####
+## ALL genes analysis FULL data
+data <- t(v.F$E[all.a1, clust.ids.F])
+
+set.seed(1234567)
+#gmm model 
+#gmm <- Mclust(data, G = 3)
+
+#fig_gmm <- fviz_cluster(object = gmm,
+#             data = data,
+ #            geom = c("text"),
+ #            labelsize = 7,
+ #            ggtheme = theme_bw(),
+ #            main = paste())
+#fig_gmm
+
+#evaluation
+#function of evaluation of km model can be  also used here
+#resum <- eval.km(result = gmm$classification, group.clust = clust.F,
+#                 geneset = "ALL",parameter.e = "G 3",
+#                 model = "hclust")
+#
+#gmm.all.F <- resum
+#gmm.all.F
+
+#### DATA DEG.F ####
+## DEG genes analysis FULL data
+data <- t(v.F$E[deg.a1, clust.ids.F])
+
+set.seed(1234567)
+#gmm model 
+gmm <- Mclust(data, G = 3)
+
+fig_gmm <- fviz_cluster(object = gmm,
+             data = data,
+             geom = c("text"),
+             labelsize = 7,
+             ggtheme = theme_bw(),
+             main = paste())
+fig_gmm
+
+#evaluation
+#function of evaluation of km model can be  also used here
+resum <- eval.km(result = gmm$classification, group.clust = clust.F,
+                 geneset = "DEG",parameter.e = "G 3",
+                 model = "GMM")
+
+gmm.DEG.F <- resum
+gmm.DEG.F
+```
+
+
+#### Density-based spatial clustering of applications with noise (DBSCAN)
+
+
+```{r DSCAN ML a1 FULL data}
+#### DBSCAN clust
+
+#### DATA all.F ####
+## ALL genes analysis FULL data
+data <- t(v.F$E[all.a1, clust.ids.F])
+
+#to select the variable eps it is displayed a knndistplot
+kNNdistplot(data, k = 50)
+abline(h = 225, lty = 2)
+
+#DBSCAN algorithm
+set_eps <- 225
+minpoints <- 25
+dbs <- dbscan(data,eps = set_eps, MinPts = minpoints)
+
+fig_dbs <- fviz_cluster(object = dbs,
+             data = data,
+             geom = c("text"),
+             labelsize = 7,
+             ggtheme = theme_bw(),
+             main = paste())
+fig_dbs
+
+#evaluation
+#function of evaluation of km model can be  also used here
+resum <- eval.km(result = dbs$cluster, 
+                 group.clust = clust.F,
+                 geneset = "ALL",parameter.e = "EPS = 225,
+                 minp = 25",
+                 model = "dbscan")
+
+dbs.all.F <- resum
+dbs.all.F
+
+#### DATA DEG.F ####
+## DEG genes analysis FULL data
+data <- t(v.F$E[deg.a1, clust.ids.F])
+
+#to select the variable eps it is displayed a knndistplot
+kNNdistplot(data, k = 25)
+abline(h = 160, lty = 2)
+
+#DBSCAN algorithm
+set_eps <- 160
+minpoints <- 25
+dbs <- dbscan(data,eps = set_eps, MinPts = minpoints)
+
+fig_dbs <- fviz_cluster(object = dbs,
+             data = data,
+             geom = c("text"),
+             labelsize = 7,
+             ggtheme = theme_bw(),
+             main = paste())
+fig_dbs
+
+#evaluation
+#function of evaluation of km model can be  also used here
+resum <- eval.km(result = dbs$cluster, 
+                 group.clust = clust.F,
+                 geneset = "DEG",parameter.e = "EPS = 180,
+                 minp = 25",
+                 model = "dbscan")
+
+dbs.DEG.F <- resum
+dbs.DEG.F
+```
+
+
+### Machine Learning conclusions for analysis 1
+
+Chunk for create a table of ML conclusions.
+
+```{r ML conclusions analysis 1}
+#final table resum
+resum_fin.a1 <- rbind(knn.all.F[,1:5],
+                      knn.DEG.F[,1:5],
+                      kme.all.F[,1:5],
+                      kme.DEG.F[,1:5],
+                      hcl.all.F[,1:5],
+                      hcl.DEG.F[,1:5],
+                      #gmm.all.F[,1:5],
+                      gmm.DEG.F[,1:5],
+                      dbs.all.F[,1:5],
+                      dbs.DEG.F[,1:5]
+)
+
+writexl::write_xlsx(x = resum_fin.a1,path = "DEAsets/ml.a1conclusions.xlsx")
+
+kable(resum_fin.a1,row.names = FALSE) %>%
+  kable_styling(position = "center")
+```
+
+
+
+## Machine Learning for analysis 2
+
+```{r variables for analysis 2}
+#col_cont.mat
+str_cancer <- c("gbm","lgg")
+count <- 1
+col_cont.mat2 <- c()
+for (i in 1:2){
+  for (j in 1:2){
+    col_cont.mat2[count] <- paste(str_cancer[i],str_cancer[j], sep = "_as_")
+    count <- count + 1
+  }
+}
+```
+
+### Supervised analysis method
+
+For supervised analysis 2 we need to build train and test dataset again.
+
+```{r train and test dataset for supervised analysis 2}
+#### Building training and test dataset.
+#dataset train and test
+set.seed(123456789)
+
+#numbers of data for each dataset
+n_train <- round(0.67*length(clust.S),0)
+n_test <- round(0.33*length(clust.S),0)
+
+#ids for each dataset
+train_ids <- sort(sample(x = 1:length(clust.S),size = n_train,replace = FALSE))
+test_ids <- c(1:length(clust.S))[-train_ids]
+
+#building training and test dataset
+train_data <- list(all.S = v.S$E[all.a2,train_ids],
+                   DEG.S = v.S$E[deg.a2,train_ids])
+test_data <- list(all.S = v.S$E[all.a2,test_ids],
+                   DEG.S = v.S$E[deg.a2,test_ids])
+
+#labelling dataset
+train_label <- clust.S[train_ids]
+test_label <- clust.S[test_ids]
+
+#proportions
+#train dataset
+round(prop.table(table(train_label)),3)*100
+#test dataset
+round(prop.table(table(test_label)),3)*100
+#dataset
+round(prop.table(table(clust.S)),3)*100
+```
+
+
+#### K nearest neighbourhood (Knn)
+
+
+```{r knn ML a2 SIM data}
+### Knn algorithm
+#Evaluating models with different k values (neighbours)
+ks <- c(3,5)
+
+#function to evaluate knn models
+eval.knn2 <-function(model, geneset, n.mod,
+                      cm = cont.mat,parameter.e = parametro, 
+                      accuracy.e = accuracy, kappa = kappa.e){
+  modelos <- c(rep(model,n.mod))
+  gens <- c(rep(geneset,n.mod))
+  resum <- data.frame(modelos, parameter.e, gens,
+                    round(accuracy.e,3), round(kappa.e,3), 
+                    cont.mat)
+  names(resum) <- c("model", "parameter", "geneset", 
+                  "accuracy", "kappa", col_cont.mat2)
+  return(resum)
+}
+
+#### DATA all.S ####
+## ALL genes analysis sim data
+data <- getset(set = "all.S")
+
+#reseting variables
+reset.var.s()
+
+#for loop to execute knn algorithm with differen k values
+j <- 0 #counter
+for (i in ks){
+  j <- j +1 #add 1 to counter
+  #execution of knn value k = i
+  test_pred <- knn(train = t(data$train), 
+                   test = t(data$test), 
+                   cl = train_label, 
+                   k=i, 
+                   prob = TRUE)
+  
+  #confusion matrix
+  conf_knn <- confusionMatrix(test_pred, test_label)
+  
+  #variables of confusion matrix to save the model
+  parametro[j] <- paste("k = ", i)
+  cont.mat<- rbind(cont.mat, c(conf_knn[["table"]]))
+  accuracy[j] <- conf_knn[["overall"]][["Accuracy"]]
+  kappa.e[j] <- conf_knn[["overall"]][["Kappa"]]
+}
+
+#evaluation
+resum <- eval.knn2(model = "kNN",
+                  n.mod = 2,
+                  geneset = "ALL",
+                  parameter.e = parametro,
+                  kappa = kappa.e)
+#tabla from knn
+knn.all.S <- resum
+knn.all.S
+
+
+
+#### DATA DEG.S ####
+## DEG genes analysis sim data
+data <- getset(set = "DEG.S")
+
+#reseting variables
+reset.var.s()
+
+#for loop to execute knn algorithm with differen k values
+j <- 0 #counter
+for (i in ks){
+  j <- j +1 #add 1 to counter
+  #execution of knn value k = i
+  test_pred <- knn(train = t(data$train), 
+                   test = t(data$test), 
+                   cl = train_label, 
+                   k=i, 
+                   prob = TRUE)
+  
+  #confusion matrix
+  conf_knn <- confusionMatrix(test_pred, test_label)
+  
+  #variables of confusion matrix to save the model
+  parametro[j] <- paste("k = ", i)
+  cont.mat<- rbind(cont.mat, c(conf_knn[["table"]]))
+  accuracy[j] <- conf_knn[["overall"]][["Accuracy"]]
+  kappa.e[j] <- conf_knn[["overall"]][["Kappa"]]
+}
+
+#evaluation
+#evaluation for models of knn
+
+resum <- eval.knn2(model = "kNN",
+                  n.mod = 2,
+                  geneset = "DEG",
+                  parameter.e = parametro,
+                  kappa = kappa.e)
+#tabla from knn
+knn.DEG.S <- resum
+knn.DEG.S
+```
+
+
+### Non-Supervised analysis method
+
+
+#### K mean
+
+
+```{r kmean ML a2 sim data}
+### Kmean algorithm
+#function to evaluate kmean models
+eval.km2 <- function(result, group.clust,
+                    geneset, parameter.e,
+                    model = "kmeans"){
+  kmeans <- result
+  group <- group.clust
+                    
+  #assign each cluster with the level group
+  km_eval <- data.frame(cluster = kmeans,
+                        group = group)
+
+  levels_new_group <- c()
+  for (i in 1:2){
+    km_eval$new_group[km_eval$group == levels(group)[i]] <- 
+      which.max(tabulate(km_eval$cluster[km_eval$group == levels(group)[i]]))
+  }
+  for (i in 1:2){
+    levels_new_group[i] <- as.character(km_eval$group[which(km_eval$new_group == i)])[2]
+  }
+  
+  actual_label <- factor(km_eval$group, levels = levels_new_group)
+  predict_cluster <- as.factor(km_eval$cluster)
+  levels(predict_cluster) <- levels_new_group
+
+  #reseting variables
+  reset.var.s()
+  
+  #to evaluate confusionmatrix
+  con_mat <- confusionMatrix(predict_cluster,actual_label)
+  cont.mat<- rbind(cont.mat,c(con_mat[["table"]]))
+  accuracy <- con_mat[["overall"]][["Accuracy"]]
+  kappa.e <- con_mat[["overall"]][["Kappa"]]
+
+  #resumen
+  resum <- data.frame(model, parameter.e, geneset,
+                    round(accuracy,3), round(kappa.e,3), 
+                    cont.mat)
+  cont.mat_names <- c()
+  for (col in colnames(con_mat[["table"]])){
+    for (row in rownames(con_mat[["table"]])){
+      cont.mat_names <- append(cont.mat_names, paste(col, "as", row))
+    }
+  }
+  names(resum) <- c("model", "parameter","geneset",
+                  "accuracy", "kappa",cont.mat_names)
+  return(resum)
+}
+
+#### DATA all.S ####
+## ALL genes analysis FULL data
+data <- t(v.S$E[all.a2, clust.ids.S])
+
+#k mean execution
+set.seed(1234567)
+km <- kmeans(data,centers = 2) #two groups
+fig_clus<- fviz_cluster(object = km,
+             data = data,
+             geom = c("text"),
+             labelsize = 7,
+             ggtheme = theme_bw(),
+             main = paste())
+fig_clus
+
+##Evaluation
+
+
+resum <- eval.km(result = km$cluster,
+                 group.clust = clust.S,
+                 geneset = "ALL",parameter.e = "2 groups")
+
+#kmean table
+kme.all.S <- resum
+kme.all.S
+
+#### DATA DEG.F ####
+## ALL genes analysis FULL data
+data <- t(v.S$E[deg.a2, clust.ids.S])
+
+#k mean execution
+#set.seed(1234)
+km <- kmeans(data,centers = 2) #three groups
+fig_clus<- fviz_cluster(object = km,
+                        data = data,
+                        geom = c("text"),
+                        labelsize = 7,
+                        ggtheme = theme_bw(),
+                        main = paste())
+fig_clus
+
+##Evaluation
+
+
+resum <- eval.km(result = km$cluster,
+                 group.clust = clust.S,
+                 geneset = "DEG",parameter.e = "2 groups")
+
+
+#kmean table
+kme.DEG.S <- resum
+kme.DEG.S
+```
+
+
+#### Hierarchical clustering
+
+
+```{r hc ML a2 sim data}
+#### Hierarchical clustering
+
+#### DATA all.S ####
+## ALL genes analysis sim data
+data <- t(v.S$E[all.a2, clust.ids.S])
+
+set.seed(123)
+d <- dist(data, method = "euclidean")
+# Hierarchical clustering using Complete Linkage
+hc <- hclust(d, method = "ward.D" )
+# Cut tree into 2 groups
+sub_grp <- cutree(hc, k = 2)
+
+# Plot full dendogram
+fig_hc <-fviz_dend(
+  hc,
+  k = 2,
+  horiz = FALSE,
+  rect = TRUE,
+  rect_fill = TRUE,
+  rect_border = "jco",
+  k_colors = "jco",
+  cex = 0.3
+)
+fig_hc
+
+#evaluation
+#function of evaluation of km model can be used here
+resum <- eval.km(result = sub_grp, group.clust = clust.S,
+                 geneset = "ALL",parameter.e = "cutree 2",
+                 model = "hclust")
+
+hcl.all.S <- resum
+hcl.all.S
+
+#### DATA DEG.S ####
+## DEG genes analysis sim data
+data <- t(v.S$E[deg.a2, clust.ids.S])
+
+set.seed(123)
+d <- dist(data, method = "euclidean")
+# Hierarchical clustering using Complete Linkage
+hc <- hclust(d, method = "ward.D" )
+# Cut tree into 2 groups
+sub_grp <- cutree(hc, k = 2)
+
+# Plot full dendogram
+fig_hc <-fviz_dend(
+  hc,
+  k = 2,
+  horiz = FALSE,
+  rect = TRUE,
+  rect_fill = TRUE,
+  rect_border = "jco",
+  k_colors = "jco",
+  cex = 0.3
+)
+fig_hc
+
+#evaluation
+#function of evaluation of km model can be used here
+resum <- eval.km(result = sub_grp, group.clust = clust.S,
+                 geneset = "DEG",parameter.e = "cutree 2",
+                 model = "hclust")
+
+hcl.DEG.S <- resum
+hcl.DEG.S
+```
+
+
+#### Gaussian Mixture Model (GMM)
+
+For GMM and all genes dataset algorith couln't be implemented due to stack overflow related problem.
+
+```{r GMM ML a2 sim data}
+#### Gaussian Mixture Model
+
+#### DATA all.S ####
+## ALL genes analysis sim data
+data <- t(v.S$E[all.a2, clust.ids.S])
+
+set.seed(1234567)
+#gmm model 
+#gmm <- Mclust(data, G = 2)
+
+#fig_gmm <- fviz_cluster(object = gmm,
+#             data = data,
+#             geom = c("text"),
+#             labelsize = 7,
+#             ggtheme = theme_bw(),
+#             main = paste())
+#fig_gmm
+
+#evaluation
+#function of evaluation of km model can be  also used here
+#resum <- eval.km(result = gmm$classification, group.clust = clust.S,
+#                 geneset = "ALL",parameter.e = "G 2",
+#                 model = "GMM")
+
+#gmm.all.S <- resum
+#gmm.all.S
+
+#### DATA DEG.S ####
+## DEG genes analysis sim data
+data <- t(v.S$E[deg.a2, clust.ids.S])
+
+set.seed(1234567)
+#gmm model 
+gmm <- Mclust(data, G = 2)
+
+fig_gmm <- fviz_cluster(object = gmm,
+             data = data,
+             geom = c("text"),
+             labelsize = 7,
+             ggtheme = theme_bw(),
+             main = paste())
+fig_gmm
+
+#evaluation
+#function of evaluation of km model can be  also used here
+resum <- eval.km(result = gmm$classification, group.clust = clust.S,
+                 geneset = "DEG",parameter.e = "G 2",
+                 model = "GMM")
+
+gmm.DEG.S <- resum
+gmm.DEG.S
+```
+
+
+#### Density-based spatial clustering of applications with noise (DBSCAN)
+
+
+```{r DSCAN ML a2 sim data}
+#### DBSCAN clust
+
+#### DATA all.S ####
+## ALL genes analysis sim data
+data <- t(v.S$E[all.a2, clust.ids.S])
+
+#to select the variable eps it is displayed a knndistplot
+kNNdistplot(data, k = 15)
+abline(h = 150, lty = 2)
+
+#DBSCAN algorithm
+set_eps <- 140
+minpoints <- 15
+dbs <- dbscan(data,eps = set_eps, MinPts = minpoints)
+
+fig_dbs <- fviz_cluster(object = dbs,
+             data = data,
+             geom = c("text"),
+             labelsize = 7,
+             ggtheme = theme_bw(),
+             main = paste())
+fig_dbs #only one group so it won't be evaluated
+
+#evaluation
+#function of evaluation of km model can be  also used here
+resum <- eval.km(result = dbs$cluster, 
+                 group.clust = clust.S,
+                 geneset = "ALL",parameter.e = "EPS = 140,
+                 minp = 15",
+                 model = "dbscan")
+
+dbs.all.S <- resum
+dbs.all.S
+
+#### DATA DEG.S ####
+## DEG genes analysis sim data
+data <- t(v.S$E[deg.a2, clust.ids.S])
+
+#to select the variable eps it is displayed a knndistplot
+kNNdistplot(data, k = 15)
+abline(h = 55, lty = 2)
+
+#DBSCAN algorithm
+set_eps <- 50
+minpoints <- 15
+dbs <- dbscan(data,eps = set_eps, MinPts = minpoints)
+
+fig_dbs <- fviz_cluster(object = dbs,
+             data = data,
+             geom = c("text"),
+             labelsize = 7,
+             ggtheme = theme_bw(),
+             main = paste())
+fig_dbs
+
+#evaluation
+#function of evaluation of km model can be  also used here
+resum <- eval.km(result = dbs$cluster, 
+                 group.clust = clust.S,
+                 geneset = "DEG",parameter.e = "EPS = 50,
+                 minp = 15",
+                 model = "dbscan")
+
+dbs.DEG.S <- resum
+dbs.DEG.S
+```
+
+### Machine Learning conclusions for analysis 2
+
+Chunk for create a table of ML conclusions.
+
+```{r ML conclusions analysis 2}
+#final table resum
+resum_fin.a2 <- rbind(knn.all.S[,1:5],
+                      knn.DEG.S[,1:5],
+                      kme.all.S[,1:5],
+                      kme.DEG.S[,1:5],
+                      hcl.all.S[,1:5],
+                      hcl.DEG.S[,1:5],
+                      #gmm.all.S[,1:5],
+                      gmm.DEG.S[,1:5],
+                      dbs.all.S[,1:5],
+                      dbs.DEG.S[,1:5])
+
+
+kable(resum_fin.a2,row.names = FALSE) %>%
+  kable_styling(position = "center")
+```
+
+## References
+
+
+
+
